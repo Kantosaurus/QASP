@@ -1,0 +1,1 @@
+"""Framing module tests."""
