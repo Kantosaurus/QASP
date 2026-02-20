@@ -1,0 +1,62 @@
+# QASP Development Services for Podman Compose
+# Usage: podman-compose up <service>
+
+services:
+  # Interactive development shell with source mounts
+  dev:
+    build:
+      context: .
+      target: dev
+    image: qasp:dev
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./src:/app/src:Z
+      - ./tests:/app/tests:Z
+    working_dir: /app
+
+  # Test runner with source mounts
+  test:
+    build:
+      context: .
+      target: test
+    image: qasp:test
+    volumes:
+      - ./src:/app/src:Z
+      - ./tests:/app/tests:Z
+    working_dir: /app
+
+  # Full static analysis (ruff + mypy + bandit)
+  lint:
+    build:
+      context: .
+      target: lint
+    image: qasp:lint
+    volumes:
+      - ./src:/app/src:Z
+      - ./tests:/app/tests:Z
+    working_dir: /app
+
+  # Type checking only (mypy)
+  typecheck:
+    build:
+      context: .
+      target: lint
+    image: qasp:lint
+    volumes:
+      - ./src:/app/src:Z
+    working_dir: /app
+    entrypoint: ["mypy"]
+    command: ["src/"]
+
+  # Security analysis only (bandit)
+  security:
+    build:
+      context: .
+      target: lint
+    image: qasp:lint
+    volumes:
+      - ./src:/app/src:Z
+    working_dir: /app
+    entrypoint: ["bandit"]
+    command: ["-r", "src/"]

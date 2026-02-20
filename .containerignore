@@ -1,0 +1,76 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python bytecode and caches
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv
+venv
+ENV
+env
+
+# IDE and editors
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings
+
+# Build artifacts
+*.egg-info
+*.egg
+dist
+build
+eggs
+parts
+sdist
+develop-eggs
+.installed.cfg
+lib
+lib64
+wheels
+
+# Testing and coverage
+.tox
+.nox
+.coverage
+.coverage.*
+htmlcov
+.pytest_cache
+.hypothesis
+
+# MyPy cache
+.mypy_cache
+.dmypy.json
+dmypy.json
+
+# Ruff cache
+.ruff_cache
+
+# Documentation build
+docs/_build
+
+# Local development
+*.local
+.env
+.env.*
+
+# Claude and other AI tools
+.claude
+
+# Container-specific
+Dockerfile
+.containerignore
+compose.yaml
+docker-compose*.yml
+docker-compose*.yaml

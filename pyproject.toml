@@ -39,6 +39,7 @@ dependencies = [
     "aioquic>=1.0.0",
     "mcp>=1.26.0",
     "a2a-python>=0.0.1",
+    "base58>=2.1.0",
 ]
 
 [project.optional-dependencies]
@@ -113,6 +114,7 @@ module = [
     "aioquic.*",
     "mcp.*",
     "a2a.*",
+    "base58.*",
 ]
 ignore_missing_imports = true
 
