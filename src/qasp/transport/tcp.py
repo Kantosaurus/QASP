@@ -89,6 +89,16 @@ class TCPTransport:
         """Return True if the transport is connected."""
         return self._connected and self._writer is not None
 
+    @property
+    def is_established(self) -> bool:
+        """Return True if the QASP connection is established."""
+        return self._connection.is_established
+
+    @property
+    def session_id(self) -> bytes | None:
+        """Return the session ID if established, None otherwise."""
+        return self._connection.session_id
+
     async def connect(
         self,
         host: str,
@@ -265,6 +275,61 @@ class TCPTransport:
             await self.send(data)
 
         return events
+
+    async def perform_handshake(self, timeout: float = 30.0) -> list[Event]:
+        """Perform complete QASP-Shake handshake over TCP.
+
+        This method performs the full handshake sequence:
+        - Client: sends ClientHello → receives ServerHello → sends ClientAuth
+        - Server: receives ClientHello → sends ServerHello → receives ClientAuth
+
+        Args:
+            timeout: Timeout in seconds for waiting on receive operations.
+
+        Returns:
+            List of all events generated during the handshake.
+
+        Raises:
+            ConnectionTimeoutError: If a receive operation times out.
+            ConnectionClosedError: If the connection is closed during handshake.
+            TransportError: If a transport error occurs.
+        """
+        all_events: list[Event] = []
+
+        if self._connection._is_client:
+            # Client flow
+            events = self._connection.initiate_handshake()
+            all_events.extend(events)
+            while data := self._connection.bytes_to_send():
+                await self.send(data)
+
+            # Receive ServerHello
+            response = await asyncio.wait_for(self.receive(), timeout=timeout)
+            events = self._connection.receive_bytes(response)
+            all_events.extend(events)
+
+            # Send ClientAuth
+            while data := self._connection.bytes_to_send():
+                await self.send(data)
+        else:
+            # Server flow
+            request = await asyncio.wait_for(self.receive(), timeout=timeout)
+            events = self._connection.receive_bytes(request)
+            all_events.extend(events)
+
+            while data := self._connection.bytes_to_send():
+                await self.send(data)
+
+            # Receive ClientAuth
+            response = await asyncio.wait_for(self.receive(), timeout=timeout)
+            events = self._connection.receive_bytes(response)
+            all_events.extend(events)
+
+        # Flush any remaining data
+        while data := self._connection.bytes_to_send():
+            await self.send(data)
+
+        return all_events
 
     async def _read_exactly(self, n: int) -> bytes:
         """Read exactly n bytes from the connection.

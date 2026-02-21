@@ -65,12 +65,12 @@
 - Set up development environment documentation
 
 ### Week 1 Checkpoint
-✅ `pip install -e .` works  
-✅ ML-KEM-768 + ML-DSA-65 passing ACVP test vectors  
-✅ Hybrid KEM producing shared secrets  
-✅ CBOR encoding/decoding all 20 message types  
-✅ Basic TCP echo server running  
-✅ CI pipeline green  
+- [x] `pip install -e .` works  
+- [x] ML-KEM-768 + ML-DSA-65 passing ACVP test vectors  
+- [x] Hybrid KEM producing shared secrets  
+- [x] CBOR encoding/decoding all 20 message types  
+- [x] Basic TCP echo server running  
+- [x] CI pipeline green  
 
 ---
 
@@ -119,11 +119,11 @@
 - Fuzz CBOR message parsing with Atheris
 
 ### Week 2 Checkpoint
-✅ Two agents complete a PQ handshake over TCP  
-✅ Encrypted messages exchanged post-handshake  
-✅ Capability tokens: create, sign, verify, attenuate, split  
-✅ Delegation chain up to depth 3 verified correctly  
-✅ Audit VCs issued and verified  
+- [x] Two agents complete a PQ handshake over TCP  
+- [x] Encrypted messages exchanged post-handshake  
+- [x] Capability tokens: create, sign, verify, attenuate, split  
+- [x] Delegation chain up to depth 3 verified correctly  
+- [x] Audit VCs issued and verified  
 
 ---
 
@@ -179,11 +179,11 @@
 - Test revocation cascade: revoke root token → all descendants invalidated across servers
 
 ### Week 3 Checkpoint
-✅ Full trust scoring engine: audit VCs + Bayesian reputation + behavioral FSM  
-✅ Composite trust score computed and updated in real-time  
-✅ Metered resource accounting with hash-chained dual-signed receipts  
-✅ Token revocation with cascade propagation  
-✅ Service discovery via well-known endpoint and mDNS  
+- [ ] Full trust scoring engine: audit VCs + Bayesian reputation + behavioral FSM
+- [ ] Composite trust score computed and updated in real-time
+- [ ] Metered resource accounting with hash-chained dual-signed receipts
+- [ ] Token revocation with cascade propagation
+- [ ] Service discovery via well-known endpoint and mDNS  
 
 ---
 
@@ -229,10 +229,10 @@
 - Payment test: agent consumes resources, micropayments settled via payment channel
 
 ### Week 4 Checkpoint
-✅ MCP bridge: QASP agents accessible as MCP servers and vice versa  
-✅ A2A bridge: QASP agents discoverable via Agent Cards, tasks flow through QASP  
-✅ Payment channels operational with signed state updates  
-✅ Dispute resolution Auditor service working  
+- [ ] MCP bridge: QASP agents accessible as MCP servers and vice versa
+- [ ] A2A bridge: QASP agents discoverable via Agent Cards, tasks flow through QASP
+- [ ] Payment channels operational with signed state updates
+- [ ] Dispute resolution Auditor service working  
 
 ---
 
@@ -287,11 +287,11 @@
 - Performance benchmarks: handshake latency, token create/verify time, delegation chain depth vs. verification time
 
 ### Week 5 Checkpoint
-✅ All 4 demo scenarios running end-to-end  
-✅ Downgrade resistance enforced  
-✅ Tool-chaining firebreaks working  
-✅ Security test suite passing  
-✅ Performance benchmarks documented  
+- [ ] All 4 demo scenarios running end-to-end
+- [ ] Downgrade resistance enforced
+- [ ] Tool-chaining firebreaks working
+- [ ] Security test suite passing
+- [ ] Performance benchmarks documented  
 
 ---
 
@@ -346,14 +346,14 @@
 - Tag `v0.1.0`, push to PyPI, publish documentation
 
 ### Week 6 Checkpoint
-✅ ProVerif model verifying authentication, secrecy, forward secrecy  
-✅ Tamarin model verifying delegation safety  
-✅ Complete protocol specification document  
-✅ did:qasp method specification  
-✅ Trust scoring specification  
-✅ PyPI package published  
-✅ Conformance test suite with Docker harness  
-✅ All 4 demo scenarios as runnable examples  
+- [ ] ProVerif model verifying authentication, secrecy, forward secrecy
+- [ ] Tamarin model verifying delegation safety
+- [ ] Complete protocol specification document
+- [ ] did:qasp method specification
+- [ ] Trust scoring specification
+- [ ] PyPI package published
+- [ ] Conformance test suite with Docker harness
+- [ ] All 4 demo scenarios as runnable examples  
 
 ---
 

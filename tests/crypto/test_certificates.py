@@ -7,9 +7,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from qasp.crypto.certificates import (
+    ML_DSA_65_OID,
     Certificate,
     CertificateError,
-    ML_DSA_65_OID,
     create_self_signed,
     parse_certificate,
     verify_certificate,
@@ -27,8 +27,8 @@ class TestSelfSignedCertificate:
             keypair=mldsa_keypair,
         )
         assert isinstance(cert, Certificate)
-        assert cert.subject == "Test"
-        assert cert.issuer == "Test"
+        assert cert.subject == "CN=Test"
+        assert cert.issuer == "CN=Test"
 
     def test_certificate_has_public_key(self, mldsa_keypair: tuple[bytes, bytes]) -> None:
         """Certificate contains the public key."""

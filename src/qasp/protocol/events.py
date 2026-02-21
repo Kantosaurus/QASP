@@ -19,12 +19,16 @@ __all__ = [
     "HandshakeComplete",
     "HandshakeFailed",
     "HandshakeInitiated",
+    "HandshakeTimeout",
     "MeterAckSent",
     "MeterReportReceived",
     "ResourceDenied",
     "ResourceGranted",
     "ResourceReleased",
     "ResourceRequested",
+    "StreamClosed",
+    "StreamDataReceived",
+    "StreamOpened",
     "TokenIssued",
     "TokenRevoked",
     "TokenVerified",
@@ -81,6 +85,21 @@ class HandshakeFailed(Event):
 
     reason: str
     fatal: bool = True
+
+
+@dataclass(frozen=True)
+class HandshakeTimeout(Event):
+    """Handshake timed out waiting for peer response.
+
+    Attributes:
+        timeout_ms: The timeout duration in milliseconds.
+        retry_count: Number of retries attempted so far.
+        will_retry: Whether the connection will attempt a retry.
+    """
+
+    timeout_ms: int
+    retry_count: int
+    will_retry: bool
 
 
 # =============================================================================
@@ -302,3 +321,49 @@ class AlertReceived(Event):
     level: int
     description: int
     message: str = ""
+
+
+# =============================================================================
+# Stream Multiplexing Events
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class StreamOpened(Event):
+    """A new multiplexed stream was opened.
+
+    Attributes:
+        stream_id: The unique stream identifier.
+        capability_token_id: Optional associated capability token.
+    """
+
+    stream_id: int
+    capability_token_id: bytes | None = None
+
+
+@dataclass(frozen=True)
+class StreamDataReceived(Event):
+    """Data was received on a multiplexed stream.
+
+    Attributes:
+        stream_id: The stream the data was received on.
+        data: The received data.
+        end_stream: True if this is the last data on the stream.
+    """
+
+    stream_id: int
+    data: bytes
+    end_stream: bool = False
+
+
+@dataclass(frozen=True)
+class StreamClosed(Event):
+    """A multiplexed stream was closed.
+
+    Attributes:
+        stream_id: The closed stream's identifier.
+        reason: Optional reason for closure.
+    """
+
+    stream_id: int
+    reason: str = ""

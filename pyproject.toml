@@ -130,6 +130,8 @@ addopts = [
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
+    "property: marks tests as property-based tests (Hypothesis)",
+    "fuzz: marks tests that require Atheris (Linux only)",
 ]
 
 [tool.bandit]

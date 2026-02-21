@@ -10,6 +10,9 @@ from __future__ import annotations
 import secrets
 from typing import TYPE_CHECKING
 
+from qasp.crypto.aead import decrypt, encrypt
+from qasp.crypto.exceptions import DecryptionError
+from qasp.crypto.kdf import derive_key
 from qasp.framing.codec import (
     HEADER_SIZE,
     HMAC_SIZE,
@@ -38,6 +41,17 @@ from .events import (
     HandshakeComplete,
     HandshakeFailed,
     HandshakeInitiated,
+    HandshakeTimeout,
+    StreamClosed,
+    StreamDataReceived,
+    StreamOpened,
+)
+from .handshake import (
+    Handshake,
+    HandshakeConfig,
+    HandshakeErrorType,
+    HandshakeFailure,
+    HandshakeKeys,
 )
 from .states import (
     ConnectionState,
@@ -48,6 +62,8 @@ from .states import (
 
 if TYPE_CHECKING:
     from qasp.crypto.hybrid import HybridKeypair
+
+    from .stream import StreamManager
 
 __all__ = [
     "QASPConnection",
@@ -66,7 +82,15 @@ class QASPConnection:
     - No blocking I/O is performed internally
 
     Usage:
-        conn = QASPConnection(keypair, is_client=True)
+        # Generate keypairs
+        kem_keypair = hybrid.generate_keypair()
+        sig_public, sig_secret = signatures.generate_keypair()
+
+        conn = QASPConnection(
+            kem_keypair=kem_keypair,
+            sig_keypair=(sig_public, sig_secret),
+            is_client=True,
+        )
 
         # Client initiates handshake
         conn.initiate_handshake()
@@ -84,23 +108,35 @@ class QASPConnection:
 
     def __init__(
         self,
-        keypair: HybridKeypair,
+        kem_keypair: HybridKeypair,
+        sig_keypair: tuple[bytes, bytes],
         is_client: bool = True,
         hmac_key: bytes | None = None,
+        config: HandshakeConfig | None = None,
+        certificate: bytes | None = None,
     ) -> None:
         """Initialize a QASP connection.
 
         Args:
-            keypair: The local hybrid keypair for this connection.
+            kem_keypair: The local hybrid keypair for key encapsulation.
+            sig_keypair: The local signature keypair as (public_key, secret_key).
             is_client: True if this is a client connection, False for server.
             hmac_key: Optional HMAC key for frame integrity. If None, a
                 temporary key is used until handshake establishes session key.
+            config: Optional handshake configuration.
+            certificate: Optional certificate for authentication.
         """
-        self._keypair = keypair
+        self._kem_keypair = kem_keypair
+        self._sig_keypair = sig_keypair
         self._is_client = is_client
+        self._config = config or HandshakeConfig()
+        self._certificate = certificate
         self._state = ConnectionState.IDLE
-        self._peer_public_key: bytes | None = None
+        self._peer_kem_public: bytes | None = None
+        self._peer_sig_public: bytes | None = None
         self._session_id: bytes | None = None
+        self._session_key: bytes | None = None
+        self._nonce_iv: bytes | None = None
 
         # Frame integrity key (temporary until session established)
         self._hmac_key = hmac_key if hmac_key is not None else secrets.token_bytes(32)
@@ -113,9 +149,15 @@ class QASPConnection:
         self._send_seq = 0
         self._recv_seq = 0
 
-        # Handshake state
-        self._client_random: bytes | None = None
-        self._server_random: bytes | None = None
+        # Handshake state machine
+        self._handshake: Handshake | None = None
+
+        # Retry and timeout tracking
+        self._retry_count = 0
+        self._current_timeout_ms = self._config.initial_timeout_ms
+
+        # Stream multiplexing manager
+        self._stream_manager: StreamManager | None = None
 
     @property
     def state(self) -> ConnectionState:
@@ -133,9 +175,113 @@ class QASPConnection:
         return self._state in (ConnectionState.CLOSED, ConnectionState.ERROR)
 
     @property
+    def retry_count(self) -> int:
+        """Return the current retry count."""
+        return self._retry_count
+
+    def get_current_timeout(self) -> int:
+        """Return the current timeout in milliseconds.
+
+        Returns:
+            Current timeout value, accounting for any backoff applied.
+        """
+        return self._current_timeout_ms
+
+    def should_retry(self, error_type: HandshakeErrorType) -> bool:
+        """Determine if a retry should be attempted for the given error.
+
+        Args:
+            error_type: The type of handshake error that occurred.
+
+        Returns:
+            True if a retry should be attempted, False otherwise.
+        """
+        # Auth failures should not be retried
+        if error_type == HandshakeErrorType.AUTH_FAILED:
+            return False
+
+        # KEM failures should not be retried (cryptographic issue)
+        if error_type == HandshakeErrorType.KEM_FAILED:
+            return False
+
+        # Check if we've exceeded max retries
+        if self._retry_count >= self._config.max_retries:
+            return False
+
+        # Version mismatch and timeout are retryable
+        return error_type in (
+            HandshakeErrorType.VERSION_MISMATCH,
+            HandshakeErrorType.TIMEOUT,
+        )
+
+    def prepare_retry(self) -> None:
+        """Prepare for a retry attempt by incrementing count and applying backoff.
+
+        Updates the retry count and calculates the new timeout using
+        exponential backoff, capped at max_timeout_ms.
+        """
+        self._retry_count += 1
+
+        # Calculate new timeout with exponential backoff
+        new_timeout = int(
+            self._current_timeout_ms * self._config.backoff_multiplier
+        )
+
+        # Cap at max timeout
+        self._current_timeout_ms = min(new_timeout, self._config.max_timeout_ms)
+
+    def handle_timeout(self) -> list[Event]:
+        """Handle a handshake timeout.
+
+        Returns:
+            List of events including HandshakeTimeout.
+        """
+        will_retry = self.should_retry(HandshakeErrorType.TIMEOUT)
+
+        events: list[Event] = [
+            HandshakeTimeout(
+                timeout_ms=self._current_timeout_ms,
+                retry_count=self._retry_count,
+                will_retry=will_retry,
+            )
+        ]
+
+        if will_retry:
+            self.prepare_retry()
+        else:
+            # Max retries exceeded, transition to error state
+            try:
+                self._transition_to(ConnectionState.ERROR)
+            except StateTransitionError:
+                self._state = ConnectionState.ERROR
+            events.append(
+                HandshakeFailed(
+                    reason=f"Handshake timeout after {self._retry_count} retries",
+                    fatal=True,
+                )
+            )
+
+        return events
+
+    @property
     def session_id(self) -> bytes | None:
         """Return the session ID if established, None otherwise."""
         return self._session_id
+
+    @property
+    def session_key(self) -> bytes | None:
+        """Return the session key if established, None otherwise."""
+        return self._session_key
+
+    @property
+    def peer_kem_public_key(self) -> bytes | None:
+        """Return the peer's KEM public key if known, None otherwise."""
+        return self._peer_kem_public
+
+    @property
+    def peer_sig_public_key(self) -> bytes | None:
+        """Return the peer's signature public key if known, None otherwise."""
+        return self._peer_sig_public
 
     def _transition_to(self, new_state: ConnectionState) -> None:
         """Transition to a new state.
@@ -149,6 +295,21 @@ class QASPConnection:
         if not is_valid_transition(self._state, new_state):
             raise StateTransitionError(self._state, new_state)
         self._state = new_state
+
+    def _construct_nonce(self, sequence_number: int) -> bytes:
+        """Construct AES-GCM nonce: 4-byte IV + 8-byte sequence.
+
+        TLS 1.3 style counter-based nonce construction ensures unique
+        nonces without additional per-message overhead.
+
+        Args:
+            sequence_number: The message sequence number.
+
+        Returns:
+            12-byte nonce suitable for AES-256-GCM.
+        """
+        assert self._nonce_iv is not None
+        return self._nonce_iv + sequence_number.to_bytes(8, "big")
 
     def initiate_handshake(self) -> list[Event]:
         """Initiate the QASP-Shake handshake.
@@ -169,20 +330,17 @@ class QASPConnection:
         if not self._is_client:
             raise ProtocolError("Only clients can initiate handshake")
 
-        # Generate client random
-        self._client_random = secrets.token_bytes(32)
-
-        # Build ClientHello message
-        # Note: HybridKeypair contains KEM keys; signature keys would come
-        # from a separate signing keypair in a full implementation
-        client_hello = ClientHello(
-            protocol_version=(1, 0),
-            client_random=self._client_random,
-            kem_public_key=self._keypair.public_key,  # Combined hybrid public key
-            sig_public_key=b"",  # Signature key would come from separate keypair
-            cipher_suites=(1,),  # Default cipher suite
-            extensions=b"",
+        # Create handshake state machine
+        self._handshake = Handshake(
+            kem_keypair=self._kem_keypair,
+            sig_keypair=self._sig_keypair,
+            is_initiator=True,
+            config=self._config,
+            certificate=self._certificate,
         )
+
+        # Generate ClientHello
+        client_hello = self._handshake.create_client_hello()
 
         # Encode and queue for sending
         frame = encode_frame(client_hello, self._hmac_key)
@@ -288,31 +446,30 @@ class QASPConnection:
 
         assert isinstance(message, ClientHello)
 
-        # Store client's data
-        self._client_random = message.client_random
-        self._peer_public_key = message.kem_public_key
+        # Create server handshake state machine
+        self._handshake = Handshake(
+            kem_keypair=self._kem_keypair,
+            sig_keypair=self._sig_keypair,
+            is_initiator=False,
+            config=self._config,
+            certificate=self._certificate,
+        )
+
+        # Process ClientHello and generate ServerHello
+        result = self._handshake.process_client_hello(message)
+
+        if isinstance(result, HandshakeFailure):
+            return self._handle_handshake_failure(result)
+
+        # result is ServerHello
+        server_hello = result
+
+        # Encode and queue for sending
+        frame = encode_frame(server_hello, self._hmac_key)
+        self._send_buffer.extend(frame)
 
         # Transition to HELLO_RECEIVED
         self._transition_to(ConnectionState.HELLO_RECEIVED)
-
-        # Generate server random and response
-        self._server_random = secrets.token_bytes(32)
-
-        # Build ServerHello - simplified for skeleton
-        # Full implementation would do KEM encapsulation here
-        server_hello = ServerHello(
-            protocol_version=(1, 0),
-            server_random=self._server_random,
-            kem_ciphertext=b"",  # Would be actual KEM ciphertext
-            kem_public_key=self._keypair.public_key,  # Combined hybrid public key
-            sig_public_key=b"",  # Signature key would come from separate keypair
-            selected_cipher_suite=1,
-            signature=b"",  # Would be actual signature
-            extensions=b"",
-        )
-
-        frame = encode_frame(server_hello, self._hmac_key)
-        self._send_buffer.extend(frame)
 
         return [HandshakeInitiated(initiator=False)]
 
@@ -329,37 +486,40 @@ class QASPConnection:
                 )
             ]
 
+        if self._handshake is None:
+            return [
+                HandshakeFailed(
+                    reason="No handshake in progress",
+                    fatal=True,
+                )
+            ]
+
         assert isinstance(message, ServerHello)
 
-        # Store server's data
-        self._server_random = message.server_random
-        self._peer_public_key = message.kem_public_key
+        # Process ServerHello and generate ClientAuth
+        result = self._handshake.process_server_hello(message)
+
+        if isinstance(result, HandshakeFailure):
+            return self._handle_handshake_failure(result)
+
+        # result is ClientAuth
+        client_auth = result
+
+        # Encode and queue for sending
+        frame = encode_frame(client_auth, self._hmac_key)
+        self._send_buffer.extend(frame)
 
         # Transition to AUTHENTICATED
         self._transition_to(ConnectionState.AUTHENTICATED)
 
-        # Send ClientAuth
-        client_auth = ClientAuth(
-            kem_ciphertext=b"",  # Would be actual KEM ciphertext
-            signature=b"",  # Would be actual signature
-            certificate=b"",
-        )
+        # Complete client handshake
+        keys_result = self._handshake.complete_client_handshake()
 
-        frame = encode_frame(client_auth, self._hmac_key)
-        self._send_buffer.extend(frame)
+        if isinstance(keys_result, HandshakeFailure):
+            return self._handle_handshake_failure(keys_result)
 
-        # Generate session ID
-        self._session_id = secrets.token_bytes(32)
-
-        # Transition to ESTABLISHED
-        self._transition_to(ConnectionState.ESTABLISHED)
-
-        return [
-            HandshakeComplete(
-                peer_public_key=self._peer_public_key,
-                session_id=self._session_id,
-            )
-        ]
+        # keys_result is HandshakeKeys
+        return self._complete_handshake(keys_result)
 
     def _handle_client_auth(self, message: Message) -> list[Event]:
         """Handle ClientAuth (server side)."""
@@ -374,25 +534,106 @@ class QASPConnection:
                 )
             ]
 
+        if self._handshake is None:
+            return [
+                HandshakeFailed(
+                    reason="No handshake in progress",
+                    fatal=True,
+                )
+            ]
+
         assert isinstance(message, ClientAuth)
 
-        # Verify client auth - simplified for skeleton
-        # Full implementation would verify signature
+        # Process ClientAuth and complete handshake
+        result = self._handshake.process_client_auth(message)
 
+        if isinstance(result, HandshakeFailure):
+            return self._handle_handshake_failure(result)
+
+        # result is HandshakeKeys
         # Transition through AUTHENTICATED to ESTABLISHED
         self._transition_to(ConnectionState.AUTHENTICATED)
 
-        # Generate session ID
-        self._session_id = secrets.token_bytes(32)
+        return self._complete_handshake(result)
 
+    def _complete_handshake(self, keys: HandshakeKeys) -> list[Event]:
+        """Complete the handshake with derived keys.
+
+        Args:
+            keys: The derived handshake keys.
+
+        Returns:
+            List of events including HandshakeComplete.
+        """
+        # Store session data
+        self._session_key = keys.session_key
+        self._session_id = keys.session_id
+        self._peer_kem_public = keys.peer_kem_public
+        self._peer_sig_public = keys.peer_sig_public
+
+        # Derive nonce IV for AES-GCM encryption
+        # Uses HKDF to derive 4 bytes for the IV prefix from session key
+        self._nonce_iv = derive_key(
+            input_key_material=keys.session_key,
+            info=b"qasp_nonce_iv",
+            length=4,
+        )
+
+        # Switch to session key for HMAC
+        self._hmac_key = keys.session_key
+
+        # Transition to ESTABLISHED
         self._transition_to(ConnectionState.ESTABLISHED)
+
+        # Clear handshake state machine
+        self._handshake = None
+
+        # Initialize stream manager for connection multiplexing
+        from .stream import StreamManager
+
+        self._stream_manager = StreamManager(
+            connection=self,
+            is_client=self._is_client,
+        )
 
         return [
             HandshakeComplete(
-                peer_public_key=self._peer_public_key or b"",
-                session_id=self._session_id,
+                peer_public_key=keys.peer_kem_public,
+                session_id=keys.session_id,
             )
         ]
+
+    def _handle_handshake_failure(self, failure: HandshakeFailure) -> list[Event]:
+        """Handle a handshake failure by sending alert.
+
+        Args:
+            failure: The handshake failure details.
+
+        Returns:
+            List of events including HandshakeFailed.
+        """
+        # Send alert to peer
+        alert = Alert(
+            level=2,  # Fatal
+            description=failure.alert_code,
+            message=failure.message,
+            related_message_type=0,
+        )
+
+        try:
+            frame = encode_frame(alert, self._hmac_key)
+            self._send_buffer.extend(frame)
+        except FramingError:
+            # If encoding fails, just continue with failure
+            pass
+
+        # Transition to ERROR state
+        try:
+            self._transition_to(ConnectionState.ERROR)
+        except StateTransitionError:
+            self._state = ConnectionState.ERROR
+
+        return [HandshakeFailed(reason=failure.message, fatal=True)]
 
     def _handle_application_data(self, message: Message) -> list[Event]:
         """Handle ApplicationData."""
@@ -406,7 +647,7 @@ class QASPConnection:
 
         assert isinstance(message, ApplicationData)
 
-        # Verify sequence number
+        # Verify sequence number for replay protection
         if message.sequence_number < self._recv_seq:
             return [
                 ConnectionError(
@@ -417,11 +658,27 @@ class QASPConnection:
 
         self._recv_seq = message.sequence_number + 1
 
-        # In full implementation, would decrypt the data
-        # For skeleton, pass through as-is
+        # Decrypt the payload using AES-256-GCM
+        assert self._session_key is not None
+        nonce = self._construct_nonce(message.sequence_number)
+        aad = (
+            bytes([MessageType.APPLICATION_DATA.value])
+            + message.sequence_number.to_bytes(8, "big")
+        )
+
+        try:
+            plaintext = decrypt(
+                key=self._session_key,
+                nonce=nonce,
+                ciphertext=message.encrypted_data,
+                associated_data=aad,
+            )
+        except DecryptionError as e:
+            return [ConnectionError(error=f"Decryption failed: {e}", fatal=True)]
+
         return [
             DataReceived(
-                data=message.encrypted_data,
+                data=plaintext,
                 sequence_number=message.sequence_number,
             )
         ]
@@ -485,10 +742,19 @@ class QASPConnection:
         seq = self._send_seq
         self._send_seq += 1
 
-        # In full implementation, would encrypt the data
-        # For skeleton, pass through as-is
+        # Encrypt the payload using AES-256-GCM
+        assert self._session_key is not None
+        nonce = self._construct_nonce(seq)
+        aad = bytes([MessageType.APPLICATION_DATA.value]) + seq.to_bytes(8, "big")
+        _, ciphertext = encrypt(
+            key=self._session_key,
+            plaintext=data,
+            associated_data=aad,
+            nonce=nonce,
+        )
+
         app_data = ApplicationData(
-            encrypted_data=data,
+            encrypted_data=ciphertext,
             sequence_number=seq,
         )
 
@@ -496,6 +762,135 @@ class QASPConnection:
         self._send_buffer.extend(frame)
 
         return [DataSent(length=len(data), sequence_number=seq)]
+
+    def open_stream(self, capability_token_id: bytes | None = None) -> tuple[int, list[Event]]:
+        """Open a new multiplexed stream.
+
+        Args:
+            capability_token_id: Optional capability token to associate.
+
+        Returns:
+            Tuple of (stream_id, events).
+
+        Raises:
+            ProtocolError: If connection is not established.
+        """
+        if self._state != ConnectionState.ESTABLISHED:
+            raise ProtocolError(
+                f"Cannot open stream in state {self._state.name}"
+            )
+
+        if self._stream_manager is None:
+            raise ProtocolError("Stream manager not initialized")
+
+        stream_id = self._stream_manager.open_stream(capability_token_id)
+        event = StreamOpened(stream_id=stream_id, capability_token_id=capability_token_id)
+        return stream_id, [event]
+
+    def send_stream_data(
+        self, stream_id: int, data: bytes, end_stream: bool = False
+    ) -> list[Event]:
+        """Send data on a specific stream.
+
+        This queues stream frame data for encryption and sending.
+
+        Args:
+            stream_id: The stream to send on.
+            data: The data to send.
+            end_stream: If True, close the stream after sending.
+
+        Returns:
+            List of events (StreamDataReceived for acknowledgment).
+
+        Raises:
+            ProtocolError: If connection is not established.
+            ValueError: If stream doesn't exist or can't send.
+        """
+        if self._state != ConnectionState.ESTABLISHED:
+            raise ProtocolError(
+                f"Cannot send stream data in state {self._state.name}"
+            )
+
+        if self._stream_manager is None:
+            raise ProtocolError("Stream manager not initialized")
+
+        # Queue the data on the stream
+        self._stream_manager.send(stream_id, data, end_stream)
+
+        # Get pending stream data and send as encrypted ApplicationData
+        pending_data = self._stream_manager.get_pending_data()
+        if pending_data:
+            self.send_data(pending_data)
+
+        events: list[Event] = []
+        if end_stream:
+            events.append(StreamClosed(stream_id=stream_id, reason="local_close"))
+
+        return events
+
+    def close_stream(self, stream_id: int) -> list[Event]:
+        """Close a specific stream.
+
+        Args:
+            stream_id: The stream to close.
+
+        Returns:
+            List of events.
+
+        Raises:
+            ProtocolError: If connection is not established.
+            ValueError: If stream doesn't exist.
+        """
+        if self._state != ConnectionState.ESTABLISHED:
+            raise ProtocolError(
+                f"Cannot close stream in state {self._state.name}"
+            )
+
+        if self._stream_manager is None:
+            raise ProtocolError("Stream manager not initialized")
+
+        self._stream_manager.close_stream(stream_id)
+
+        # Send pending stream data
+        pending_data = self._stream_manager.get_pending_data()
+        if pending_data:
+            self.send_data(pending_data)
+
+        return [StreamClosed(stream_id=stream_id, reason="local_close")]
+
+    def process_stream_data(self, data: bytes) -> list[Event]:
+        """Process received data as stream frames.
+
+        This should be called with decrypted ApplicationData payload
+        when using stream multiplexing.
+
+        Args:
+            data: Decrypted payload containing stream frames.
+
+        Returns:
+            List of StreamDataReceived events.
+        """
+        if self._stream_manager is None:
+            return []
+
+        events: list[Event] = []
+        for stream_id, payload, is_end in self._stream_manager.process_received_data(data):
+            events.append(
+                StreamDataReceived(
+                    stream_id=stream_id,
+                    data=payload,
+                    end_stream=is_end,
+                )
+            )
+            if is_end:
+                events.append(StreamClosed(stream_id=stream_id, reason="remote_close"))
+
+        return events
+
+    @property
+    def stream_manager(self) -> StreamManager | None:
+        """Return the stream manager if initialized."""
+        return self._stream_manager
 
     def close(self, reason: str = "") -> list[Event]:
         """Initiate connection close.
@@ -545,11 +940,17 @@ class QASPConnection:
         This allows reusing the connection object for a new session.
         """
         self._state = ConnectionState.IDLE
-        self._peer_public_key = None
+        self._peer_kem_public = None
+        self._peer_sig_public = None
         self._session_id = None
+        self._session_key = None
+        self._nonce_iv = None
         self._recv_buffer.clear()
         self._send_buffer.clear()
         self._send_seq = 0
         self._recv_seq = 0
-        self._client_random = None
-        self._server_random = None
+        self._handshake = None
+        self._stream_manager = None
+        self._hmac_key = secrets.token_bytes(32)
+        self._retry_count = 0
+        self._current_timeout_ms = self._config.initial_timeout_ms

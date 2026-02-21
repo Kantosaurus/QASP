@@ -83,17 +83,24 @@ class TestSign:
 
         assert sig1 != sig2
 
-    def test_same_message_different_signatures(
-        self, mldsa_secret_key: bytes
+    def test_same_message_signatures(
+        self, mldsa_keypair: tuple[bytes, bytes]
     ) -> None:
-        """Same message may produce different signatures (randomized)."""
-        message = b"Same message"
-        sig1 = signatures.sign(mldsa_secret_key, message)
-        sig2 = signatures.sign(mldsa_secret_key, message)
+        """Same message produces valid signatures (may or may not be identical).
 
-        # ML-DSA is deterministic, so signatures should be the same
-        # This test documents the behavior
-        assert sig1 == sig2
+        Note: ML-DSA-65 can use either deterministic or hedged (randomized)
+        signing modes per FIPS 204. liboqs may use hedged mode for fault
+        protection, so we only verify that signatures are valid.
+        """
+        public_key, secret_key = mldsa_keypair
+        message = b"Same message"
+        sig1 = signatures.sign(secret_key, message)
+        sig2 = signatures.sign(secret_key, message)
+
+        # Both signatures must be valid
+        assert signatures.verify(public_key, message, sig1)
+        assert signatures.verify(public_key, message, sig2)
+        # Note: sig1 == sig2 depends on whether liboqs uses deterministic or hedged mode
 
     def test_rejects_invalid_secret_key_size(self) -> None:
         """Should reject secret key with wrong size."""

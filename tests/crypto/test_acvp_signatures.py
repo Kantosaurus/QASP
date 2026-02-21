@@ -157,16 +157,23 @@ class TestACVPRoundTrip:
             sig = signatures.sign(sk, message)
             assert signatures.verify(pk, message, sig)
 
-    def test_deterministic_signatures(self) -> None:
-        """Verify ML-DSA produces deterministic signatures."""
-        _pk, sk = signatures.generate_keypair()
+    def test_same_message_produces_valid_signatures(self) -> None:
+        """Verify ML-DSA produces valid signatures for same message.
+
+        Note: ML-DSA-65 can use either deterministic or hedged (randomized)
+        signing modes per FIPS 204. liboqs may use hedged mode for fault
+        protection, so we only verify that signatures are valid.
+        """
+        pk, sk = signatures.generate_keypair()
         message = b"Deterministic test message"
 
         sig1 = signatures.sign(sk, message)
         sig2 = signatures.sign(sk, message)
 
-        # ML-DSA-65 should be deterministic
-        assert sig1 == sig2
+        # Both signatures must be valid
+        assert signatures.verify(pk, message, sig1)
+        assert signatures.verify(pk, message, sig2)
+        # Note: sig1 == sig2 depends on whether liboqs uses deterministic or hedged mode
 
     def test_different_messages_different_signatures(self) -> None:
         """Different messages should produce different signatures."""

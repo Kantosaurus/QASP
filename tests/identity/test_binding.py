@@ -14,6 +14,7 @@ from qasp.identity import (
     verify_binding_chain,
     verify_owner_binding,
 )
+from qasp.identity.binding import OwnerBinding
 from qasp.identity.exceptions import (
     BindingExpiredError,
     BindingPermissionError,
@@ -190,22 +191,35 @@ class TestBindingVerification:
         owner_public_key: bytes,
     ) -> None:
         """Verification fails for expired binding."""
+        # Create a valid binding first
         binding = create_owner_binding(
             agent_did=sample_agent_did,
             owner_did=sample_owner_did,
             owner_secret_key=owner_secret_key,
             permissions={Permission.COMM_INITIATE.value},
-            validity_seconds=1,  # 1 second
+            validity_seconds=1,
         )
-        # Simulate expiry by checking is_expired with future time
-        future = datetime.now(UTC) + timedelta(seconds=10)
-        assert binding.is_expired(future)
+
+        # Create an already-expired binding by copying with past expiry
+        # The signature won't match, but expiry check happens first
+        expired_binding = OwnerBinding(
+            agent_did=binding.agent_did,
+            owner_did=binding.owner_did,
+            permissions=binding.permissions,
+            expiry=datetime.now(UTC) - timedelta(seconds=10),  # Already expired
+            created=binding.created,
+            nonce=binding.nonce,
+            signature=binding.signature,
+            max_delegation_depth=binding.max_delegation_depth,
+            parent_binding_hash=binding.parent_binding_hash,
+        )
+
+        # Verify the binding is expired
+        assert expired_binding.is_expired()
 
         # Verification should fail with expiry check
         with pytest.raises(BindingExpiredError):
-            # Create a truly expired binding by manipulating time
-            # For this test, we'll just check the is_expired method
-            verify_owner_binding(binding, owner_public_key, check_expiry=True)
+            verify_owner_binding(expired_binding, owner_public_key, check_expiry=True)
 
     def test_verify_without_expiry_check(
         self,
