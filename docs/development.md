@@ -19,6 +19,23 @@ git clone <repo-url> && cd QASP
 podman-compose up --build dev
 ```
 
+```bash
+ # One-time: start the machine
+  podman machine start
+
+  # Build the image (only needed when Dockerfile changes)
+  podman build --target dev -t qasp:dev .
+
+  # Run the dev shell
+  podman run -it --rm -v ./src:/app/src:Z -v ./tests:/app/tests:Z -w /app qasp:dev
+
+  # Run all tests (using dev image)
+  podman run --rm -v ./src:/app/src:Z -v ./tests:/app/tests:Z -w /app qasp:dev -c "pytest -v"                                                                                                              
+  
+  # Run all tests (using the dedicated test image)
+  podman run --rm -v ./src:/app/src:Z -v ./tests:/app/tests:Z qasp:test
+```
+
 This drops you into a shell with liboqs pre-built, all Python deps installed, and `src/` + `tests/` bind-mounted so edits on the host are reflected immediately.
 
 ## Native Setup

@@ -119,6 +119,7 @@ class TestACVPSigVer:
             pk = hex_to_bytes(vector["pk"])
             message = hex_to_bytes(vector["message"])
             sig = hex_to_bytes(vector["signature"])
+            context = hex_to_bytes(vector.get("context", ""))
             should_pass = vector["testPassed"]
 
             # Validate sizes
@@ -129,12 +130,12 @@ class TestACVPSigVer:
 
             if should_pass:
                 # Should verify successfully
-                result = signatures.verify(pk, message, sig)
+                result = signatures.verify(pk, message, sig, context=context)
                 assert result is True, f"Vector {vector.get('tcId', 'unknown')} should pass"
             else:
                 # Should fail verification
                 with pytest.raises(InvalidSignatureError):
-                    signatures.verify(pk, message, sig)
+                    signatures.verify(pk, message, sig, context=context)
 
 
 class TestACVPRoundTrip:

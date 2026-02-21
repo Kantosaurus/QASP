@@ -140,6 +140,7 @@ class QASPConnection:
 
         # Frame integrity key (temporary until session established)
         self._hmac_key = hmac_key if hmac_key is not None else secrets.token_bytes(32)
+        self._initial_hmac_key = hmac_key  # preserve for reset()
 
         # Buffer management
         self._recv_buffer = bytearray()
@@ -951,6 +952,6 @@ class QASPConnection:
         self._recv_seq = 0
         self._handshake = None
         self._stream_manager = None
-        self._hmac_key = secrets.token_bytes(32)
+        self._hmac_key = self._initial_hmac_key if self._initial_hmac_key is not None else secrets.token_bytes(32)
         self._retry_count = 0
         self._current_timeout_ms = self._config.initial_timeout_ms

@@ -99,13 +99,21 @@ def sign(secret_key: bytes, message: bytes) -> bytes:
         raise SignatureError(f"ML-DSA-65 signing failed: {e}") from e
 
 
-def verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
+def verify(
+    public_key: bytes,
+    message: bytes,
+    signature: bytes,
+    context: bytes | None = None,
+) -> bool:
     """Verify a signature using the public key.
 
     Args:
         public_key: The signer's public key (1952 bytes).
         message: The original message.
         signature: The signature to verify.
+        context: Optional FIPS 204 context string for the external
+            signing interface.  When *None* (the default), liboqs
+            verifies with an empty context.
 
     Returns:
         True if the signature is valid.
@@ -129,7 +137,12 @@ def verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
 
     try:
         sig = oqs.Signature(_ALGORITHM)
-        is_valid = sig.verify(message, signature, public_key)
+        if context is not None:
+            is_valid = sig.verify_with_ctx_str(
+                message, signature, context, public_key
+            )
+        else:
+            is_valid = sig.verify(message, signature, public_key)
         if not is_valid:
             raise InvalidSignatureError("Signature verification failed")
         return True

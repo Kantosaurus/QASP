@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     ca-certificates \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone and build liboqs

@@ -107,5 +107,8 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# ACVP test vectors (downloaded via scripts/download_acvp_vectors.py)
+tests/crypto/vectors/
+
 # Ruff
 .ruff_cache/
