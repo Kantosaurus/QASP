@@ -79,8 +79,15 @@ from .stream import (
     StreamManager,
     StreamState,
 )
+from .aggregation import (
+    DelegationChain,
+    aggregate_sign,
+    aggregate_verify_chain,
+    attenuate_token_aggregate,
+)
 
 __all__ = [
+    "DelegationChain",
     "NORMAL_GRACE_PERIOD_SECONDS",
     "VALID_TRANSITIONS",
     "AlertReceived",
@@ -138,6 +145,9 @@ __all__ = [
     "TokenIssued",
     "TokenRevoked",
     "TokenVerified",
+    "aggregate_sign",
+    "aggregate_verify_chain",
+    "attenuate_token_aggregate",
     "check_revocation",
     "is_valid_transition",
     "revoke_token",
