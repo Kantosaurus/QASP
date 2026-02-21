@@ -10,7 +10,7 @@
 | ninja | any | Build liboqs from source |
 | Podman + podman-compose | any | Containerized workflow (optional) |
 
-## Quick Start (Podman)
+## Quick Start (Podman/Docker)
 
 The fastest path — no need to build liboqs locally:
 
@@ -34,6 +34,31 @@ podman-compose up --build dev
   
   # Run all tests (using the dedicated test image)
   podman run --rm -v ./src:/app/src:Z -v ./tests:/app/tests:Z qasp:test
+```
+
+
+```bash
+  │ Stage │      Target       │               Purpose               │                  Command                  │                                                                                            ├───────┼───────────────────┼─────────────────────────────────────┼───────────────────────────────────────────┤                                                                                          
+  │ dev   │ Development shell │ Full dev environment with all tools │ docker build --target dev -t qasp-dev .   │                                                                                          
+  ├───────┼───────────────────┼─────────────────────────────────────┼───────────────────────────────────────────┤
+  │ test  │ Test runner       │ Runs pytest                         │ docker build --target test -t qasp-test . │
+  ├───────┼───────────────────┼─────────────────────────────────────┼───────────────────────────────────────────┤
+  │ lint  │ Static analysis   │ Runs ruff, mypy, bandit             │ docker build --target lint -t qasp-lint . │
+  └───────┴───────────────────┴─────────────────────────────────────┴───────────────────────────────────────────┘
+
+  How to use it:
+
+  # Build and run tests
+  docker build --target test -t qasp-test .
+  docker run --rm qasp-test
+
+  # Build and run linters
+  docker build --target lint -t qasp-lint .
+  docker run --rm qasp-lint
+
+  # Interactive dev shell
+  docker build --target dev -t qasp-dev .
+  docker run --rm -it qasp-dev
 ```
 
 This drops you into a shell with liboqs pre-built, all Python deps installed, and `src/` + `tests/` bind-mounted so edits on the host are reflected immediately.

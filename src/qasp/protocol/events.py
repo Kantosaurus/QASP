@@ -15,6 +15,9 @@ __all__ = [
     "ConnectionError",
     "DataReceived",
     "DataSent",
+    "DisputeEvidenceReceived",
+    "DisputeOpened",
+    "DisputeResolved",
     "Event",
     "HandshakeComplete",
     "HandshakeFailed",
@@ -26,6 +29,8 @@ __all__ = [
     "ResourceGranted",
     "ResourceReleased",
     "ResourceRequested",
+    "RevocationCascadeComplete",
+    "RevocationGracePeriodStarted",
     "StreamClosed",
     "StreamDataReceived",
     "StreamOpened",
@@ -167,6 +172,36 @@ class TokenRevoked(Event):
 
 
 @dataclass(frozen=True)
+class RevocationCascadeComplete(Event):
+    """A revocation cascade completed.
+
+    Attributes:
+        root_token_id: Token ID that initiated the cascade.
+        revoked_token_ids: All token IDs revoked in the cascade.
+        urgency: Urgency level of the revocation.
+    """
+
+    root_token_id: bytes
+    revoked_token_ids: tuple[bytes, ...]
+    urgency: int
+
+
+@dataclass(frozen=True)
+class RevocationGracePeriodStarted(Event):
+    """A non-critical revocation grace period has started.
+
+    Attributes:
+        token_id: Token ID entering grace period.
+        effective_time: Unix timestamp when revocation becomes effective.
+        urgency: Urgency level of the revocation.
+    """
+
+    token_id: bytes
+    effective_time: int
+    urgency: int
+
+
+@dataclass(frozen=True)
 class TokenVerified(Event):
     """A capability token was successfully verified.
 
@@ -275,6 +310,56 @@ class MeterAckSent(Event):
 
     meter_id: bytes
     acked_count: int
+
+
+# =============================================================================
+# Dispute Events
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DisputeOpened(Event):
+    """A dispute was opened.
+
+    Attributes:
+        dispute_id: Unique identifier for the dispute.
+        token_id: Token related to the dispute.
+        dispute_type: Type of dispute (maps to DisputeType IntEnum).
+    """
+
+    dispute_id: bytes
+    token_id: bytes
+    dispute_type: int
+
+
+@dataclass(frozen=True)
+class DisputeEvidenceReceived(Event):
+    """Evidence was submitted for a dispute.
+
+    Attributes:
+        dispute_id: Identifier of the dispute.
+        evidence_type: Type of evidence submitted.
+        submitter: DID of the evidence submitter.
+    """
+
+    dispute_id: bytes
+    evidence_type: int
+    submitter: str
+
+
+@dataclass(frozen=True)
+class DisputeResolved(Event):
+    """A dispute was resolved with a verdict.
+
+    Attributes:
+        dispute_id: Identifier of the resolved dispute.
+        verdict: Verdict code (maps to VerdictCode IntEnum).
+        awarded_value: Value awarded to the winner.
+    """
+
+    dispute_id: bytes
+    verdict: int
+    awarded_value: int
 
 
 # =============================================================================

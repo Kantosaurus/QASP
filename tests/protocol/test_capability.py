@@ -9,20 +9,28 @@ import pytest
 from qasp.identity import DID, DIDRegistry
 from qasp.protocol.capability import (
     AttenuationError,
+    AuthorityChainEntry,
     CapabilityToken,
     Constraints,
     DelegationDepthExceeded,
     InvalidDelegationChainError,
     InvalidTokenError,
     LocalDIDResolver,
+    MultiOwnerCapabilityToken,
+    MultiOwnerValidationError,
     TokenConstraintViolation,
     TokenNotYetValidError,
     TokenUsage,
+    ToolchainViolationError,
     VerbSet,
     attenuate_token,
+    create_multi_owner_token,
+    create_sub_invocation_token,
     create_token,
+    intersect_constraints,
     split_token,
     verify_delegation_chain,
+    verify_multi_owner_token,
     verify_token,
 )
 
@@ -1105,3 +1113,531 @@ class TestCBOREncoding:
         invalid_data = cbor2.dumps({"token_id": "abc"})  # Missing other fields
         with pytest.raises(InvalidTokenError):
             CapabilityToken.from_cbor(invalid_data)
+
+
+# =============================================================================
+# Toolchain Constraints Tests
+# =============================================================================
+
+
+class TestToolchainConstraints:
+    """Tests for allowed_toolchain in Constraints."""
+
+    def test_contiguous_sublist_is_tighter(self) -> None:
+        """A contiguous sublist toolchain is tighter."""
+        parent = Constraints(allowed_toolchain=("data-fetch", "compute", "storage"))
+        child = Constraints(allowed_toolchain=("data-fetch", "compute"))
+        assert child.is_tighter_than(parent)
+
+    def test_non_contiguous_is_not_tighter(self) -> None:
+        """A non-contiguous sublist is not tighter."""
+        parent = Constraints(allowed_toolchain=("data-fetch", "compute", "storage"))
+        child = Constraints(allowed_toolchain=("data-fetch", "storage"))
+        assert not child.is_tighter_than(parent)
+
+    def test_empty_child_is_tighter(self) -> None:
+        """Empty child toolchain is tighter than any parent."""
+        parent = Constraints(allowed_toolchain=("data-fetch", "compute"))
+        child = Constraints(allowed_toolchain=())
+        assert child.is_tighter_than(parent)
+
+    def test_empty_parent_allows_anything(self) -> None:
+        """Empty parent toolchain does not constrain child."""
+        parent = Constraints(allowed_toolchain=())
+        child = Constraints(allowed_toolchain=("data-fetch",))
+        assert child.is_tighter_than(parent)
+
+    def test_tighten_intersection(self) -> None:
+        """Tighten intersects toolchains preserving self order."""
+        base = Constraints(allowed_toolchain=("data-fetch", "compute", "storage"))
+        delta = Constraints(allowed_toolchain=("compute", "storage", "notification"))
+        result = base.tighten(delta)
+        assert result.allowed_toolchain == ("compute", "storage")
+
+
+# =============================================================================
+# Sub-Invocation Token Tests
+# =============================================================================
+
+
+class TestSubInvocationToken:
+    """Tests for create_sub_invocation_token."""
+
+    def test_position_advances(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        subject_did: DID,
+        subject_secret_key: bytes,
+        delegate_did: DID,
+    ) -> None:
+        """Toolchain position advances by 1."""
+        parent = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"execute"},
+            constraints=Constraints(
+                allowed_toolchain=("data-fetch", "compute", "storage"),
+            ),
+            max_delegation_depth=3,
+        )
+        assert parent.toolchain_position == 0
+
+        child = create_sub_invocation_token(
+            parent_token=parent,
+            holder_secret_key=subject_secret_key,
+            target_tool_class="data-fetch",
+            new_subject_did=delegate_did,
+        )
+        assert child.toolchain_position == 1
+
+    def test_wrong_tool_raises(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        subject_did: DID,
+        subject_secret_key: bytes,
+        delegate_did: DID,
+    ) -> None:
+        """Wrong target tool class raises ToolchainViolationError."""
+        parent = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"execute"},
+            constraints=Constraints(
+                allowed_toolchain=("data-fetch", "compute"),
+            ),
+            max_delegation_depth=2,
+        )
+
+        with pytest.raises(ToolchainViolationError, match="does not match"):
+            create_sub_invocation_token(
+                parent_token=parent,
+                holder_secret_key=subject_secret_key,
+                target_tool_class="compute",  # Should be "data-fetch"
+                new_subject_did=delegate_did,
+            )
+
+    def test_exhausted_chain_raises(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        subject_did: DID,
+        subject_secret_key: bytes,
+        delegate_did: DID,
+        delegate_secret_key: bytes,
+        third_party_did: DID,
+    ) -> None:
+        """Exhausted toolchain raises ToolchainViolationError."""
+        parent = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"execute"},
+            constraints=Constraints(
+                allowed_toolchain=("data-fetch",),
+            ),
+            max_delegation_depth=3,
+        )
+
+        child = create_sub_invocation_token(
+            parent_token=parent,
+            holder_secret_key=subject_secret_key,
+            target_tool_class="data-fetch",
+            new_subject_did=delegate_did,
+        )
+        assert child.toolchain_position == 1
+
+        with pytest.raises(ToolchainViolationError, match="exhausted"):
+            create_sub_invocation_token(
+                parent_token=child,
+                holder_secret_key=delegate_secret_key,
+                target_tool_class="compute",
+                new_subject_did=third_party_did,
+            )
+
+    def test_no_toolchain_allows_any(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        subject_did: DID,
+        subject_secret_key: bytes,
+        delegate_did: DID,
+    ) -> None:
+        """No toolchain constraint allows any tool class."""
+        parent = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"execute"},
+            max_delegation_depth=2,
+        )
+
+        child = create_sub_invocation_token(
+            parent_token=parent,
+            holder_secret_key=subject_secret_key,
+            target_tool_class="anything",
+            new_subject_did=delegate_did,
+        )
+        assert child.toolchain_position == 1
+
+    def test_verb_reduction(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        subject_did: DID,
+        subject_secret_key: bytes,
+        delegate_did: DID,
+    ) -> None:
+        """Sub-invocation can reduce verbs."""
+        parent = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"read", "execute"},
+            constraints=Constraints(
+                allowed_toolchain=("data-fetch", "compute"),
+            ),
+            max_delegation_depth=2,
+        )
+
+        child = create_sub_invocation_token(
+            parent_token=parent,
+            holder_secret_key=subject_secret_key,
+            target_tool_class="data-fetch",
+            new_subject_did=delegate_did,
+            reduced_verbs=VerbSet({"read"}),
+        )
+        assert "read" in child.verbs
+        assert "execute" not in child.verbs
+
+    def test_constraint_tightening(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        subject_did: DID,
+        subject_secret_key: bytes,
+        delegate_did: DID,
+    ) -> None:
+        """Sub-invocation can tighten constraints."""
+        parent = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"execute"},
+            constraints=Constraints(
+                quantity_limit=100,
+                allowed_toolchain=("data-fetch",),
+            ),
+            max_delegation_depth=2,
+        )
+
+        child = create_sub_invocation_token(
+            parent_token=parent,
+            holder_secret_key=subject_secret_key,
+            target_tool_class="data-fetch",
+            new_subject_did=delegate_did,
+            tightened_constraints=Constraints(quantity_limit=50),
+        )
+        assert child.constraints.quantity_limit == 50
+
+
+# =============================================================================
+# Toolchain Usage Verification Tests
+# =============================================================================
+
+
+class TestToolchainUsageVerification:
+    """Tests for toolchain position verification during usage."""
+
+    def test_correct_tool_passes(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        issuer_public_key: bytes,
+        subject_did: DID,
+    ) -> None:
+        """Correct tool class at current position passes verification."""
+        token = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"execute"},
+            constraints=Constraints(
+                allowed_toolchain=("data-fetch", "compute"),
+            ),
+        )
+
+        usage = TokenUsage(current_tool_class="data-fetch")
+        assert verify_token(token, issuer_public_key, usage=usage)
+
+    def test_wrong_tool_raises(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        issuer_public_key: bytes,
+        subject_did: DID,
+    ) -> None:
+        """Wrong tool class raises ToolchainViolationError."""
+        token = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"execute"},
+            constraints=Constraints(
+                allowed_toolchain=("data-fetch", "compute"),
+            ),
+        )
+
+        usage = TokenUsage(current_tool_class="compute")
+        with pytest.raises(ToolchainViolationError, match="Tool class mismatch"):
+            verify_token(token, issuer_public_key, usage=usage)
+
+    def test_no_toolchain_skips_check(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        issuer_public_key: bytes,
+        subject_did: DID,
+    ) -> None:
+        """No toolchain constraint skips tool class check."""
+        token = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/pipeline",
+            verbs={"execute"},
+        )
+
+        usage = TokenUsage(current_tool_class="anything")
+        assert verify_token(token, issuer_public_key, usage=usage)
+
+
+# =============================================================================
+# Intersect Constraints Tests
+# =============================================================================
+
+
+class TestIntersectConstraints:
+    """Tests for intersect_constraints."""
+
+    def test_smallest_quantity(self) -> None:
+        """Takes the smallest quantity_limit."""
+        result = intersect_constraints([
+            Constraints(quantity_limit=100),
+            Constraints(quantity_limit=50),
+            Constraints(quantity_limit=200),
+        ])
+        assert result.quantity_limit == 50
+
+    def test_earliest_expiry(self) -> None:
+        """Takes the earliest not_after."""
+        now = datetime.now(UTC)
+        result = intersect_constraints([
+            Constraints(not_after=now + timedelta(hours=3)),
+            Constraints(not_after=now + timedelta(hours=1)),
+            Constraints(not_after=now + timedelta(hours=5)),
+        ])
+        assert result.not_after == now + timedelta(hours=1)
+
+    def test_latest_start(self) -> None:
+        """Takes the latest not_before."""
+        now = datetime.now(UTC)
+        result = intersect_constraints([
+            Constraints(not_before=now),
+            Constraints(not_before=now + timedelta(hours=2)),
+            Constraints(not_before=now + timedelta(hours=1)),
+        ])
+        assert result.not_before == now + timedelta(hours=2)
+
+    def test_scope_intersection(self) -> None:
+        """Intersects data scopes."""
+        result = intersect_constraints([
+            Constraints(data_scope=frozenset({"a", "b", "c"})),
+            Constraints(data_scope=frozenset({"b", "c", "d"})),
+        ])
+        assert result.data_scope == frozenset({"b", "c"})
+
+    def test_single_element(self) -> None:
+        """Single element returns that element."""
+        c = Constraints(quantity_limit=42)
+        result = intersect_constraints([c])
+        assert result.quantity_limit == 42
+
+    def test_empty_raises(self) -> None:
+        """Empty list raises MultiOwnerValidationError."""
+        with pytest.raises(MultiOwnerValidationError):
+            intersect_constraints([])
+
+
+# =============================================================================
+# Multi-Owner Token Tests
+# =============================================================================
+
+
+class TestMultiOwnerToken:
+    """Tests for multi-owner capability tokens."""
+
+    def test_single_chain(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        issuer_public_key: bytes,
+        subject_did: DID,
+    ) -> None:
+        """Single-chain multi-owner token validates."""
+        token = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/compute",
+            verbs={"read"},
+        )
+
+        entry = AuthorityChainEntry(
+            chain=(token,),
+            root_public_key=issuer_public_key,
+        )
+        multi = create_multi_owner_token([entry])
+        assert verify_multi_owner_token(multi)
+
+    def test_multiple_chains_validate(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        issuer_public_key: bytes,
+        subject_did: DID,
+        delegate_did: DID,
+        delegate_secret_key: bytes,
+        delegate_public_key: bytes,
+    ) -> None:
+        """Multi-chain token validates when all chains are valid."""
+        from qasp.identity import create_did as make_did
+
+        token1 = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/compute",
+            verbs={"read", "write"},
+        )
+
+        token2 = create_token(
+            issuer_did=delegate_did,
+            issuer_secret_key=delegate_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/compute",
+            verbs={"read", "execute"},
+        )
+
+        multi = create_multi_owner_token([
+            AuthorityChainEntry(chain=(token1,), root_public_key=issuer_public_key),
+            AuthorityChainEntry(chain=(token2,), root_public_key=delegate_public_key),
+        ])
+        assert verify_multi_owner_token(multi)
+
+    def test_verb_intersection(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        issuer_public_key: bytes,
+        subject_did: DID,
+        delegate_did: DID,
+        delegate_secret_key: bytes,
+        delegate_public_key: bytes,
+    ) -> None:
+        """Effective verbs are the intersection of all chains."""
+        token1 = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/compute",
+            verbs={"read", "write", "delete"},
+        )
+
+        token2 = create_token(
+            issuer_did=delegate_did,
+            issuer_secret_key=delegate_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/compute",
+            verbs={"read", "execute"},
+        )
+
+        multi = create_multi_owner_token([
+            AuthorityChainEntry(chain=(token1,), root_public_key=issuer_public_key),
+            AuthorityChainEntry(chain=(token2,), root_public_key=delegate_public_key),
+        ])
+        assert multi.effective_verbs().verbs == frozenset({"read"})
+
+    def test_constraint_intersection(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        issuer_public_key: bytes,
+        subject_did: DID,
+        delegate_did: DID,
+        delegate_secret_key: bytes,
+        delegate_public_key: bytes,
+    ) -> None:
+        """Effective constraints are the most restrictive."""
+        token1 = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/compute",
+            verbs={"read"},
+            constraints=Constraints(quantity_limit=100),
+        )
+
+        token2 = create_token(
+            issuer_did=delegate_did,
+            issuer_secret_key=delegate_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/compute",
+            verbs={"read"},
+            constraints=Constraints(quantity_limit=50),
+        )
+
+        multi = create_multi_owner_token([
+            AuthorityChainEntry(chain=(token1,), root_public_key=issuer_public_key),
+            AuthorityChainEntry(chain=(token2,), root_public_key=delegate_public_key),
+        ])
+        assert multi.effective_constraints().quantity_limit == 50
+
+    def test_invalid_chain_raises(
+        self,
+        issuer_did: DID,
+        issuer_secret_key: bytes,
+        subject_did: DID,
+        subject_public_key: bytes,
+    ) -> None:
+        """Invalid chain in multi-owner token raises MultiOwnerValidationError."""
+        token = create_token(
+            issuer_did=issuer_did,
+            issuer_secret_key=issuer_secret_key,
+            subject_did=subject_did,
+            resource_uri="/resources/compute",
+            verbs={"read"},
+        )
+
+        # Use wrong public key
+        multi = create_multi_owner_token([
+            AuthorityChainEntry(chain=(token,), root_public_key=subject_public_key),
+        ])
+        with pytest.raises(MultiOwnerValidationError, match="verification failed"):
+            verify_multi_owner_token(multi)
+
+    def test_empty_raises(self) -> None:
+        """Empty authority chains raises MultiOwnerValidationError."""
+        with pytest.raises(MultiOwnerValidationError):
+            create_multi_owner_token([])

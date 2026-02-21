@@ -6,6 +6,8 @@ import pytest
 
 from qasp.crypto import signatures
 from qasp.identity import DID, DIDDocument, DIDRegistry, create_did
+from qasp.protocol.capability import CapabilityToken, attenuate_token, create_token
+from qasp.protocol.revocation import CertificateRevocationList
 
 # =============================================================================
 # ML-DSA-65 Keypair Fixtures
@@ -171,3 +173,57 @@ def did_registry(
     registry.register(delegate_did_document)
     registry.register(third_party_did_document)
     return registry
+
+
+# =============================================================================
+# Revocation Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def crl() -> CertificateRevocationList:
+    """Create an empty Certificate Revocation List."""
+    return CertificateRevocationList()
+
+
+@pytest.fixture
+def registered_token_chain(
+    crl: CertificateRevocationList,
+    issuer_did: DID,
+    issuer_secret_key: bytes,
+    subject_did: DID,
+    subject_secret_key: bytes,
+    delegate_did: DID,
+) -> tuple[CapabilityToken, CapabilityToken, CapabilityToken]:
+    """Create a 3-level delegation chain registered in the CRL.
+
+    Returns:
+        (root_token, child_token, grandchild_token)
+    """
+    root = create_token(
+        issuer_did=issuer_did,
+        issuer_secret_key=issuer_secret_key,
+        subject_did=subject_did,
+        resource_uri="qasp://test/resource",
+        verbs={"read", "write"},
+        max_delegation_depth=3,
+    )
+    crl.register_token(root)
+
+    child = attenuate_token(
+        parent_token=root,
+        delegator_secret_key=subject_secret_key,
+        new_subject_did=delegate_did,
+        reduced_verbs=None,
+    )
+    crl.register_token(child)
+
+    grandchild = attenuate_token(
+        parent_token=child,
+        delegator_secret_key=subject_secret_key,
+        new_subject_did=issuer_did,
+        reduced_verbs=None,
+    )
+    crl.register_token(grandchild)
+
+    return root, child, grandchild

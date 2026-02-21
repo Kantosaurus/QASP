@@ -209,6 +209,9 @@ class TokenRevocation(Message):
         revocation_time: Unix timestamp of revocation.
         reason: Revocation reason code.
         signature: Signature from token issuer.
+        urgency: Revocation urgency (0=critical, 1=normal, 2=planned).
+        scheduled_time: Unix timestamp for planned revocations.
+        issuer_did: DID of the revoker.
     """
 
     message_type: MessageType = field(default=MessageType.TOKEN_REVOCATION, init=False)
@@ -216,6 +219,9 @@ class TokenRevocation(Message):
     revocation_time: int = 0
     reason: int = 0
     signature: bytes = b""
+    urgency: int = 1
+    scheduled_time: int = 0
+    issuer_did: str = ""
 
 
 @dataclass(frozen=True)
@@ -229,6 +235,8 @@ class RevocationNotice(Message):
         revocation_time: Unix timestamp of revocation.
         issuer_id: Identifier of the original token issuer.
         signature: Signature from revocation authority.
+        urgency: Revocation urgency (0=critical, 1=normal, 2=planned).
+        cascade_token_ids: Descendant token IDs also revoked.
     """
 
     message_type: MessageType = field(default=MessageType.REVOCATION_NOTICE, init=False)
@@ -236,6 +244,8 @@ class RevocationNotice(Message):
     revocation_time: int = 0
     issuer_id: bytes = b""
     signature: bytes = b""
+    urgency: int = 1
+    cascade_token_ids: tuple[bytes, ...] = ()
 
 
 # =============================================================================

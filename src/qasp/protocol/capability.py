@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AttenuationError",
+    "AuthorityChainEntry",
     "CapabilityError",
     "CapabilityToken",
     "Constraints",
@@ -34,15 +35,24 @@ __all__ = [
     "InvalidDelegationChainError",
     "InvalidTokenError",
     "LocalDIDResolver",
+    "MultiOwnerCapabilityToken",
+    "MultiOwnerValidationError",
+    "RevocationChecker",
     "TokenConstraintViolation",
     "TokenExpiredError",
     "TokenNotYetValidError",
+    "TokenRevokedError",
     "TokenUsage",
+    "ToolchainViolationError",
     "VerbSet",
     "attenuate_token",
+    "create_multi_owner_token",
+    "create_sub_invocation_token",
     "create_token",
+    "intersect_constraints",
     "split_token",
     "verify_delegation_chain",
+    "verify_multi_owner_token",
     "verify_token",
 ]
 
@@ -106,6 +116,47 @@ class InvalidDelegationChainError(CapabilityError):
     """Raised when delegation chain verification fails."""
 
     alert_code: int = 44
+
+
+class ToolchainViolationError(CapabilityError):
+    """Raised when a capability crosses a tool boundary it is not allowed to."""
+
+    alert_code: int = 52
+
+
+class MultiOwnerValidationError(CapabilityError):
+    """Raised when multi-owner token validation fails."""
+
+    alert_code: int = 53
+
+
+class TokenRevokedError(CapabilityError):
+    """Raised when a revoked token is used."""
+
+    alert_code: int = 56
+
+
+# =============================================================================
+# Protocols
+# =============================================================================
+
+
+@runtime_checkable
+class RevocationChecker(Protocol):
+    """Protocol for checking token revocation status."""
+
+    def is_revoked(self, token_id: bytes, at_time: int | None = None) -> bool:
+        """Check if a token has been revoked.
+
+        Args:
+            token_id: The token identifier to check.
+            at_time: Optional Unix timestamp to check against
+                     (for grace period handling).
+
+        Returns:
+            True if the token is revoked and the revocation is effective.
+        """
+        ...
 
 
 # =============================================================================
@@ -188,6 +239,7 @@ class Constraints:
     spend_currency: str = ""
     data_scope: frozenset[str] = field(default_factory=frozenset)
     purpose: str = ""
+    allowed_toolchain: tuple[str, ...] = ()
 
     def is_tighter_than(self, other: Constraints) -> bool:
         """Check if these constraints are tighter than (or equal to) another.
@@ -242,7 +294,13 @@ class Constraints:
             return False
 
         # purpose: must match if parent has one
-        return not other.purpose or self.purpose == other.purpose
+        if other.purpose and self.purpose != other.purpose:
+            return False
+
+        # allowed_toolchain: child must be a contiguous ordered sublist of parent
+        return not other.allowed_toolchain or _is_contiguous_sublist(
+            self.allowed_toolchain, other.allowed_toolchain
+        )
 
     def tighten(self, delta: Constraints) -> Constraints:
         """Create new constraints that are tighter by applying delta.
@@ -311,6 +369,16 @@ class Constraints:
         # purpose: prefer delta if set
         new_purpose = delta.purpose if delta.purpose else self.purpose
 
+        # allowed_toolchain: intersect preserving order of self, or adopt delta's if self is empty
+        if self.allowed_toolchain and delta.allowed_toolchain:
+            new_toolchain = tuple(
+                t for t in self.allowed_toolchain if t in delta.allowed_toolchain
+            )
+        elif delta.allowed_toolchain:
+            new_toolchain = delta.allowed_toolchain
+        else:
+            new_toolchain = self.allowed_toolchain
+
         return Constraints(
             not_before=new_not_before,
             not_after=new_not_after,
@@ -322,7 +390,23 @@ class Constraints:
             spend_currency=new_spend_currency,
             data_scope=new_data_scope,
             purpose=new_purpose,
+            allowed_toolchain=new_toolchain,
         )
+
+
+def _is_contiguous_sublist(child: tuple[str, ...], parent: tuple[str, ...]) -> bool:
+    """Check if child is a contiguous ordered sublist of parent.
+
+    Empty child is always a valid sublist.
+    """
+    if not child:
+        return True
+    if len(child) > len(parent):
+        return False
+    for start in range(len(parent) - len(child) + 1):
+        if parent[start : start + len(child)] == child:
+            return True
+    return False
 
 
 @dataclass
@@ -346,6 +430,7 @@ class TokenUsage:
     total_spend: int = 0
     data_accessed: set[str] = field(default_factory=set)
     declared_purpose: str = ""
+    current_tool_class: str = ""
 
 
 @dataclass(frozen=True)
@@ -383,6 +468,7 @@ class CapabilityToken:
     parent_token_hash: bytes | None = None
     max_delegation_depth: int = 0
     delegation_chain_length: int = 0
+    toolchain_position: int = 0
 
     def to_cbor(self) -> bytes:
         """Serialize the token to CBOR (without signature for verification).
@@ -403,6 +489,7 @@ class CapabilityToken:
             parent_token_hash=self.parent_token_hash,
             max_delegation_depth=self.max_delegation_depth,
             delegation_chain_length=self.delegation_chain_length,
+            toolchain_position=self.toolchain_position,
         )
 
     def compute_hash(self) -> bytes:
@@ -495,6 +582,9 @@ class CapabilityToken:
                 spend_currency=constraints_data.get("spend_currency", ""),
                 data_scope=frozenset(constraints_data.get("data_scope", [])),
                 purpose=constraints_data.get("purpose", ""),
+                allowed_toolchain=tuple(
+                    constraints_data.get("allowed_toolchain", [])
+                ),
             )
 
             return cls(
@@ -513,6 +603,7 @@ class CapabilityToken:
                 ),
                 max_delegation_depth=decoded.get("max_depth", 0),
                 delegation_chain_length=decoded.get("chain_len", 0),
+                toolchain_position=decoded.get("tc_pos", 0),
             )
         except (KeyError, ValueError, TypeError, cbor2.CBORDecodeError) as e:
             raise InvalidTokenError(f"Failed to parse token CBOR: {e}") from e
@@ -537,6 +628,7 @@ class CapabilityToken:
             parent_token_hash=self.parent_token_hash,
             max_delegation_depth=self.max_delegation_depth,
             delegation_chain_length=self.delegation_chain_length,
+            toolchain_position=self.toolchain_position,
         )
 
 
@@ -574,6 +666,8 @@ def _constraints_to_dict(constraints: Constraints) -> dict[str, Any]:
         result["data_scope"] = sorted(constraints.data_scope)
     if constraints.purpose:
         result["purpose"] = constraints.purpose
+    if constraints.allowed_toolchain:
+        result["allowed_toolchain"] = list(constraints.allowed_toolchain)
     return result
 
 
@@ -590,6 +684,7 @@ def _encode_token_data(
     parent_token_hash: bytes | None,
     max_delegation_depth: int,
     delegation_chain_length: int,
+    toolchain_position: int = 0,
 ) -> bytes:
     """Encode token data to CBOR for signing.
 
@@ -606,6 +701,7 @@ def _encode_token_data(
         parent_token_hash: Parent token hash (for delegated tokens).
         max_delegation_depth: Maximum delegation depth.
         delegation_chain_length: Current chain length.
+        toolchain_position: Current position in the toolchain.
 
     Returns:
         CBOR-encoded bytes.
@@ -623,6 +719,7 @@ def _encode_token_data(
         "parent": parent_token_hash.hex() if parent_token_hash else None,
         "max_depth": max_delegation_depth,
         "chain_len": delegation_chain_length,
+        "tc_pos": toolchain_position,
     }
     return cbor2.dumps(token_data)
 
@@ -641,6 +738,7 @@ def _encode_token_data_with_signature(
     parent_token_hash: bytes | None,
     max_delegation_depth: int,
     delegation_chain_length: int,
+    toolchain_position: int = 0,
 ) -> bytes:
     """Encode token data with signature to CBOR.
 
@@ -664,6 +762,7 @@ def _encode_token_data_with_signature(
         "parent": parent_token_hash.hex() if parent_token_hash else None,
         "max_depth": max_delegation_depth,
         "chain_len": delegation_chain_length,
+        "tc_pos": toolchain_position,
     }
     return cbor2.dumps(token_data)
 
@@ -730,6 +829,7 @@ def create_token(
             spend_currency=constraints.spend_currency,
             data_scope=constraints.data_scope,
             purpose=constraints.purpose,
+            allowed_toolchain=constraints.allowed_toolchain,
         )
 
     # Encode and sign
@@ -746,6 +846,7 @@ def create_token(
         parent_token_hash=None,
         max_delegation_depth=max_delegation_depth,
         delegation_chain_length=0,
+        toolchain_position=0,
     )
     signature = sign(issuer_secret_key, message)
 
@@ -763,6 +864,7 @@ def create_token(
         parent_token_hash=None,
         max_delegation_depth=max_delegation_depth,
         delegation_chain_length=0,
+        toolchain_position=0,
     )
 
 
@@ -776,6 +878,7 @@ def verify_token(
     issuer_public_key: bytes,
     check_expiry: bool = True,
     usage: TokenUsage | None = None,
+    crl: RevocationChecker | None = None,
 ) -> bool:
     """Verify a capability token's signature and constraints.
 
@@ -784,16 +887,25 @@ def verify_token(
         issuer_public_key: The issuer's ML-DSA-65 public key.
         check_expiry: Whether to check time-based constraints.
         usage: Optional usage tracking for constraint verification.
+        crl: Optional revocation checker. If provided, checks revocation
+             before other validation.
 
     Returns:
         True if the token is valid.
 
     Raises:
+        TokenRevokedError: If the token has been revoked.
         InvalidTokenError: If the signature is invalid.
         TokenExpiredError: If the token has expired.
         TokenNotYetValidError: If the token is not yet valid.
         TokenConstraintViolation: If usage violates constraints.
     """
+    # Check revocation first if CRL is provided
+    if crl is not None and crl.is_revoked(token.token_id):
+        raise TokenRevokedError(
+            f"Token {token.token_id.hex()[:16]}... has been revoked"
+        )
+
     # Verify signature
     message = token.to_cbor()
     try:
@@ -884,6 +996,20 @@ def _verify_usage_constraints(token: CapabilityToken, usage: TokenUsage) -> None
             f"required '{constraints.purpose}'"
         )
 
+    # Check toolchain position
+    if constraints.allowed_toolchain and usage.current_tool_class:
+        if token.toolchain_position >= len(constraints.allowed_toolchain):
+            raise ToolchainViolationError(
+                f"Toolchain position {token.toolchain_position} exceeds "
+                f"chain length {len(constraints.allowed_toolchain)}"
+            )
+        expected_tool = constraints.allowed_toolchain[token.toolchain_position]
+        if usage.current_tool_class != expected_tool:
+            raise ToolchainViolationError(
+                f"Tool class mismatch at position {token.toolchain_position}: "
+                f"expected '{expected_tool}', got '{usage.current_tool_class}'"
+            )
+
 
 # =============================================================================
 # Token Attenuation
@@ -896,6 +1022,7 @@ def attenuate_token(
     new_subject_did: DID,
     reduced_verbs: VerbSet | None = None,
     tightened_constraints: Constraints | None = None,
+    toolchain_position: int | None = None,
 ) -> CapabilityToken:
     """Create an attenuated token from a parent token.
 
@@ -907,6 +1034,7 @@ def attenuate_token(
         new_subject_did: The DID of the new token holder.
         reduced_verbs: New verb set (must be subset of parent).
         tightened_constraints: Additional constraint tightening.
+        toolchain_position: Toolchain position override (defaults to parent's).
 
     Returns:
         A new attenuated CapabilityToken.
@@ -945,6 +1073,12 @@ def attenuate_token(
         if not new_constraints.is_tighter_than(parent_token.constraints):
             raise AttenuationError("New constraints are not tighter than parent")
 
+    # Determine toolchain position
+    if toolchain_position is not None:
+        new_tc_pos = toolchain_position
+    else:
+        new_tc_pos = parent_token.toolchain_position
+
     # Generate new token
     nonce = os.urandom(NONCE_SIZE)
     token_id = hashlib.sha384(str(parent_token.subject_did).encode() + nonce).digest()[:32]
@@ -967,6 +1101,7 @@ def attenuate_token(
         parent_token_hash=parent_hash,
         max_delegation_depth=new_depth,
         delegation_chain_length=new_chain_length,
+        toolchain_position=new_tc_pos,
     )
     signature = sign(delegator_secret_key, message)
 
@@ -984,6 +1119,62 @@ def attenuate_token(
         parent_token_hash=parent_hash,
         max_delegation_depth=new_depth,
         delegation_chain_length=new_chain_length,
+        toolchain_position=new_tc_pos,
+    )
+
+
+def create_sub_invocation_token(
+    parent_token: CapabilityToken,
+    holder_secret_key: bytes,
+    target_tool_class: str,
+    new_subject_did: DID,
+    reduced_verbs: VerbSet | None = None,
+    tightened_constraints: Constraints | None = None,
+) -> CapabilityToken:
+    """Create a sub-invocation token for capability firebreaks.
+
+    Validates the target tool against the parent's allowed toolchain and
+    advances the toolchain position.
+
+    Args:
+        parent_token: The parent token to create a sub-invocation from.
+        holder_secret_key: The holder's secret key for signing.
+        target_tool_class: The tool class being invoked.
+        new_subject_did: The DID of the sub-invocation target.
+        reduced_verbs: Optional reduced verb set.
+        tightened_constraints: Optional tightened constraints.
+
+    Returns:
+        A new CapabilityToken with advanced toolchain position.
+
+    Raises:
+        ToolchainViolationError: If the target tool doesn't match the chain
+            or the chain is exhausted.
+    """
+    toolchain = parent_token.constraints.allowed_toolchain
+    pos = parent_token.toolchain_position
+
+    if toolchain:
+        if pos >= len(toolchain):
+            raise ToolchainViolationError(
+                f"Toolchain exhausted at position {pos} "
+                f"(chain length {len(toolchain)})"
+            )
+        if target_tool_class != toolchain[pos]:
+            raise ToolchainViolationError(
+                f"Target tool '{target_tool_class}' does not match "
+                f"expected '{toolchain[pos]}' at position {pos}"
+            )
+
+    new_position = pos + 1
+
+    return attenuate_token(
+        parent_token=parent_token,
+        delegator_secret_key=holder_secret_key,
+        new_subject_did=new_subject_did,
+        reduced_verbs=reduced_verbs,
+        tightened_constraints=tightened_constraints,
+        toolchain_position=new_position,
     )
 
 
@@ -1206,5 +1397,205 @@ def verify_delegation_chain(
                 ) from e
 
         prev_token = token
+
+    return True
+
+
+# =============================================================================
+# Multi-Owner Tokens
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class AuthorityChainEntry:
+    """A single authority chain with its root public key.
+
+    Attributes:
+        chain: Ordered tuple of tokens from root to leaf.
+        root_public_key: The public key of the root issuer.
+    """
+
+    chain: tuple[CapabilityToken, ...]
+    root_public_key: bytes
+
+
+@dataclass(frozen=True)
+class MultiOwnerCapabilityToken:
+    """A capability token requiring authorization from multiple owners.
+
+    Each authority chain represents one owner's delegation path. The
+    effective permissions are the intersection of all chains' leaf tokens.
+
+    Attributes:
+        authority_chains: Tuple of AuthorityChainEntry instances.
+    """
+
+    authority_chains: tuple[AuthorityChainEntry, ...]
+
+    def effective_verbs(self) -> VerbSet:
+        """Compute the intersection of all chains' leaf token verbs."""
+        if not self.authority_chains:
+            return VerbSet(frozenset())
+        result = self.authority_chains[0].chain[-1].verbs
+        for entry in self.authority_chains[1:]:
+            result = result.intersection(entry.chain[-1].verbs)
+        return result
+
+    def effective_constraints(self) -> Constraints:
+        """Compute the most restrictive constraints across all chains."""
+        constraints_list = [
+            entry.chain[-1].constraints for entry in self.authority_chains
+        ]
+        return intersect_constraints(constraints_list)
+
+
+def intersect_constraints(constraints_list: list[Constraints]) -> Constraints:
+    """Intersect a list of constraints, taking the most restrictive value for each field.
+
+    Args:
+        constraints_list: List of Constraints to intersect.
+
+    Returns:
+        A single Constraints with the most restrictive values.
+
+    Raises:
+        MultiOwnerValidationError: If the list is empty.
+    """
+    if not constraints_list:
+        raise MultiOwnerValidationError("Cannot intersect empty constraints list")
+
+    if len(constraints_list) == 1:
+        return constraints_list[0]
+
+    result = constraints_list[0]
+    for c in constraints_list[1:]:
+        # not_before: take latest
+        new_not_before = result.not_before
+        if c.not_before is not None and (
+            new_not_before is None or c.not_before > new_not_before
+        ):
+            new_not_before = c.not_before
+
+        # not_after: take earliest
+        new_not_after = result.not_after
+        if c.not_after is not None and (
+            new_not_after is None or c.not_after < new_not_after
+        ):
+            new_not_after = c.not_after
+
+        # quantity_limit: take smallest
+        new_quantity_limit = result.quantity_limit
+        if c.quantity_limit is not None and (
+            new_quantity_limit is None or c.quantity_limit < new_quantity_limit
+        ):
+            new_quantity_limit = c.quantity_limit
+
+        # rate_limit: take smallest
+        new_rate_limit = result.rate_limit
+        if c.rate_limit is not None and (
+            new_rate_limit is None or c.rate_limit < new_rate_limit
+        ):
+            new_rate_limit = c.rate_limit
+
+        # max_spend: take smallest
+        new_max_spend = result.max_spend
+        if c.max_spend is not None and (
+            new_max_spend is None or c.max_spend < new_max_spend
+        ):
+            new_max_spend = c.max_spend
+
+        # data_scope: intersection
+        new_data_scope = result.data_scope
+        if c.data_scope:
+            if new_data_scope:
+                new_data_scope = new_data_scope.intersection(c.data_scope)
+            else:
+                new_data_scope = c.data_scope
+
+        # allowed_toolchain: intersection preserving order
+        new_toolchain = result.allowed_toolchain
+        if c.allowed_toolchain:
+            if new_toolchain:
+                new_toolchain = tuple(
+                    t for t in new_toolchain if t in c.allowed_toolchain
+                )
+            else:
+                new_toolchain = c.allowed_toolchain
+
+        result = Constraints(
+            not_before=new_not_before,
+            not_after=new_not_after,
+            quantity_limit=new_quantity_limit,
+            quantity_unit=result.quantity_unit or c.quantity_unit,
+            rate_limit=new_rate_limit,
+            rate_period_seconds=result.rate_period_seconds,
+            max_spend=new_max_spend,
+            spend_currency=result.spend_currency or c.spend_currency,
+            data_scope=new_data_scope,
+            purpose=result.purpose or c.purpose,
+            allowed_toolchain=new_toolchain,
+        )
+
+    return result
+
+
+def create_multi_owner_token(
+    authority_chains: list[AuthorityChainEntry],
+) -> MultiOwnerCapabilityToken:
+    """Create a multi-owner capability token from authority chains.
+
+    Args:
+        authority_chains: List of authority chain entries.
+
+    Returns:
+        A MultiOwnerCapabilityToken.
+
+    Raises:
+        MultiOwnerValidationError: If authority_chains is empty.
+    """
+    if not authority_chains:
+        raise MultiOwnerValidationError(
+            "Cannot create multi-owner token with empty authority chains"
+        )
+    return MultiOwnerCapabilityToken(
+        authority_chains=tuple(authority_chains),
+    )
+
+
+def verify_multi_owner_token(
+    token: MultiOwnerCapabilityToken,
+    did_resolver: DIDResolver | None = None,
+    check_expiry: bool = True,
+) -> bool:
+    """Verify all authority chains in a multi-owner token.
+
+    Args:
+        token: The multi-owner token to verify.
+        did_resolver: Optional DID resolver for signature verification.
+        check_expiry: Whether to check time-based constraints.
+
+    Returns:
+        True if all chains are valid.
+
+    Raises:
+        MultiOwnerValidationError: If any chain fails verification.
+    """
+    if not token.authority_chains:
+        raise MultiOwnerValidationError(
+            "Cannot verify multi-owner token with empty authority chains"
+        )
+
+    for i, entry in enumerate(token.authority_chains):
+        try:
+            verify_delegation_chain(
+                tokens=list(entry.chain),
+                root_issuer_public_key=entry.root_public_key,
+                did_resolver=did_resolver,
+                check_expiry=check_expiry,
+            )
+        except (InvalidDelegationChainError, InvalidTokenError, TokenExpiredError) as e:
+            raise MultiOwnerValidationError(
+                f"Authority chain {i} verification failed: {e}"
+            ) from e
 
     return True

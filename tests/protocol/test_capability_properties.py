@@ -26,6 +26,7 @@ from qasp.protocol.capability import (
     DelegationDepthExceeded,
     VerbSet,
     attenuate_token,
+    create_sub_invocation_token,
     create_token,
 )
 
@@ -535,3 +536,81 @@ class TestDelegationDepthProperties:
                 delegator_secret_key=keypairs[depth + 1][1],
                 new_subject_did=extra_did,
             )
+
+
+# =============================================================================
+# Toolchain Strategies and Property Tests
+# =============================================================================
+
+
+COMMON_TOOLS = [
+    "data-fetch",
+    "compute",
+    "model-inference",
+    "storage",
+    "notification",
+]
+
+
+@st.composite
+def toolchain_strategy(draw: st.DrawFn) -> tuple[str, ...]:
+    """Generate an arbitrary toolchain with 1-5 tool classes."""
+    tools = draw(
+        st.lists(
+            st.sampled_from(COMMON_TOOLS),
+            min_size=1,
+            max_size=5,
+        )
+    )
+    return tuple(tools)
+
+
+@pytest.mark.property
+class TestToolchainAttenuationProperties:
+    """Property tests for toolchain attenuation behavior."""
+
+    @given(data=st.data())
+    @settings(max_examples=30)
+    def test_position_monotonically_advances(
+        self,
+        data: st.DataObject,
+    ) -> None:
+        """Sub-invocation position always advances monotonically."""
+        toolchain = data.draw(toolchain_strategy())
+        num_steps = min(len(toolchain), data.draw(st.integers(1, len(toolchain))))
+
+        # Generate enough keypairs for the chain
+        keypairs = [signatures.generate_keypair() for _ in range(num_steps + 2)]
+        dids = [create_did(kp[0])[0] for kp in keypairs]
+
+        token = create_token(
+            issuer_did=dids[0],
+            issuer_secret_key=keypairs[0][1],
+            subject_did=dids[1],
+            resource_uri="/resources/test",
+            verbs={"execute"},
+            constraints=Constraints(allowed_toolchain=toolchain),
+            max_delegation_depth=num_steps + 1,
+        )
+
+        prev_position = token.toolchain_position
+        for i in range(num_steps):
+            token = create_sub_invocation_token(
+                parent_token=token,
+                holder_secret_key=keypairs[i + 1][1],
+                target_tool_class=toolchain[i],
+                new_subject_did=dids[i + 2],
+            )
+            assert token.toolchain_position == prev_position + 1
+            prev_position = token.toolchain_position
+
+    @given(data=st.data())
+    @settings(max_examples=30)
+    def test_contiguous_sublist_reflexivity(
+        self,
+        data: st.DataObject,
+    ) -> None:
+        """A toolchain is always a contiguous sublist of itself."""
+        toolchain = data.draw(toolchain_strategy())
+        c = Constraints(allowed_toolchain=toolchain)
+        assert c.is_tighter_than(c)
