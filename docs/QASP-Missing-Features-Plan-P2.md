@@ -864,8 +864,8 @@ The output is a proof script and a concrete security bound that can be included 
 
 | # | Feature | Week | Effort | Rationale |
 |---|---------|------|--------|-----------|
-| 1 | Signature aggregation | Week 2 | 3 days | Required for delegation chains deeper than 2-3 to be practical |
-| 2 | Token aggregation algebra | Week 3 | 2 days | Foundation for multi-owner tokens and multi-source authorization |
+| 1 | Signature aggregation | Week 2 | 3 days | Required for delegation chains deeper than 2-3 to be practical | done
+| 2 | Token aggregation algebra | Week 3 | 2 days | Foundation for multi-owner tokens and multi-source authorization | done
 | 3 | Temporal capability evolution | Week 3 | 1.5 days | High demo impact, relatively simple to implement |
 | 4 | Cross-domain delegation | Week 4 | 2.5 days | Required for any multi-organization workflow |
 | 5 | Non-repudiation with privacy | Week 3 | 2 days | Required for privacy-compliant metering |

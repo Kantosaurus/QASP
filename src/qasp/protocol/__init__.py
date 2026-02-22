@@ -85,8 +85,17 @@ from .aggregation import (
     aggregate_verify_chain,
     attenuate_token_aggregate,
 )
+from .token_aggregation import (
+    AggregatedPermission,
+    ConstraintConflictError,
+    TokenAggregationError,
+    aggregate_tokens,
+    check_action_permitted,
+)
 
 __all__ = [
+    "AggregatedPermission",
+    "ConstraintConflictError",
     "DelegationChain",
     "NORMAL_GRACE_PERIOD_SECONDS",
     "VALID_TRANSITIONS",
@@ -141,13 +150,16 @@ __all__ = [
     "StreamManager",
     "StreamOpened",
     "StreamState",
+    "TokenAggregationError",
     "TokenAlreadyRevokedError",
     "TokenIssued",
     "TokenRevoked",
     "TokenVerified",
     "aggregate_sign",
+    "aggregate_tokens",
     "aggregate_verify_chain",
     "attenuate_token_aggregate",
+    "check_action_permitted",
     "check_revocation",
     "is_valid_transition",
     "revoke_token",

@@ -199,6 +199,17 @@ class VerbSet:
         """
         return VerbSet(self.verbs.intersection(other.verbs))
 
+    def union(self, other: VerbSet) -> VerbSet:
+        """Return the union of this verb set with another.
+
+        Args:
+            other: The other VerbSet to union with.
+
+        Returns:
+            A new VerbSet containing verbs from both sets.
+        """
+        return VerbSet(self.verbs.union(other.verbs))
+
     def __contains__(self, verb: str) -> bool:
         return verb in self.verbs
 

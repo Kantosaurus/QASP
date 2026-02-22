@@ -266,6 +266,8 @@ class ResourceRequest(Message):
         permissions: Requested permission bitmask.
         duration: Requested access duration in seconds.
         payment_offer: Optional payment offer for the resource.
+        capability_tokens: CBOR-encoded capability tokens to aggregate
+            for computing effective permissions. Empty by default.
     """
 
     message_type: MessageType = field(default=MessageType.RESOURCE_REQUEST, init=False)
@@ -275,6 +277,7 @@ class ResourceRequest(Message):
     permissions: int = 0
     duration: int = 0
     payment_offer: bytes = b""
+    capability_tokens: tuple[bytes, ...] = ()
 
 
 @dataclass(frozen=True)
