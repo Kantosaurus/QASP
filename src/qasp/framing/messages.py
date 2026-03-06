@@ -1,7 +1,7 @@
 """Protocol message definitions.
 
-This module defines the 20 QASP message types per Table IV of the
-QASP protocol specification (0x01-0x14).
+This module defines the 22 QASP message types per Table IV of the
+QASP protocol specification (0x01-0x16).
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ __all__ = [
     "ChannelOpen",
     "ClientAuth",
     "ClientHello",
+    "DelegationGrant",
+    "DelegationRequest",
     "DisputeEvidence",
     "DisputeOpen",
     "DisputeVerdict",
@@ -23,7 +25,13 @@ __all__ = [
     "MessageType",
     "MeterAck",
     "MeterReport",
+    "OCSPRequestMessage",
+    "OCSPResponseMessage",
+    "PriceAccept",
+    "PriceOffer",
     "PriceRequest",
+    "ReconciliationRequest",
+    "ReconciliationResponse",
     "ResourceDeny",
     "ResourceGrant",
     "ResourceRelease",
@@ -47,6 +55,7 @@ class MessageType(IntEnum):
     - 0x10: Metering
     - 0x11-0x12: Channel management
     - 0x13-0x14: Pricing and alerts
+    - 0x1B-0x1C: OCSP
     """
 
     # Handshake messages
@@ -84,6 +93,20 @@ class MessageType(IntEnum):
     # Pricing and alerts
     PRICE_REQUEST = 0x13
     ALERT = 0x14
+    PRICE_OFFER = 0x15
+    PRICE_ACCEPT = 0x16
+
+    # Cross-domain delegation
+    DELEGATION_REQUEST = 0x17
+    DELEGATION_GRANT = 0x18
+
+    # Reconciliation
+    RECONCILIATION_REQUEST = 0x19
+    RECONCILIATION_RESPONSE = 0x1A
+
+    # OCSP
+    OCSP_REQUEST = 0x1B
+    OCSP_RESPONSE = 0x1C
 
 
 @dataclass(frozen=True)
@@ -278,6 +301,8 @@ class ResourceRequest(Message):
     duration: int = 0
     payment_offer: bytes = b""
     capability_tokens: tuple[bytes, ...] = ()
+    disclosure_mode: str = "full"
+    selective_proof: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -463,6 +488,7 @@ class MeterReport(Message):
         sequence_number: Report sequence number.
         usage_count: Number of usage units.
         usage_bytes: Number of bytes used.
+        cost: Cumulative cost in smallest currency units.
         timestamp: Report timestamp.
         signature: Client signature for non-repudiation.
     """
@@ -472,6 +498,7 @@ class MeterReport(Message):
     sequence_number: int = 0
     usage_count: int = 0
     usage_bytes: int = 0
+    cost: int = 0
     timestamp: int = 0
     signature: bytes = b""
 
@@ -537,6 +564,7 @@ class PriceRequest(Message):
     Sent to query pricing for a resource.
 
     Attributes:
+        request_id: Unique request identifier for correlation.
         resource_type: Type of resource to price.
         resource_id: Specific resource identifier.
         quantity: Quantity to price.
@@ -544,6 +572,7 @@ class PriceRequest(Message):
     """
 
     message_type: MessageType = field(default=MessageType.PRICE_REQUEST, init=False)
+    request_id: bytes = b""
     resource_type: str = ""
     resource_id: bytes = b""
     quantity: int = 0
@@ -568,3 +597,233 @@ class Alert(Message):
     description: int = 0
     message: str = ""
     related_message_type: int = 0
+
+
+# =============================================================================
+# Price Negotiation Messages (0x15-0x16)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class PriceOffer(Message):
+    """Price offer message (0x15).
+
+    Sent in response to a PriceRequest with pricing terms.
+
+    Attributes:
+        request_id: Correlates to the PriceRequest.
+        resource_type: Type of resource being priced.
+        unit_price: Price per unit in smallest currency denomination.
+        currency: Currency identifier (e.g. "credits").
+        valid_from: Unix timestamp for start of validity.
+        valid_until: Unix timestamp for end of validity.
+        signature: ML-DSA-65 signature over CBOR(fields - signature).
+    """
+
+    message_type: MessageType = field(default=MessageType.PRICE_OFFER, init=False)
+    request_id: bytes = b""
+    resource_type: str = ""
+    unit_price: int = 0
+    currency: str = ""
+    valid_from: int = 0
+    valid_until: int = 0
+    signature: bytes = b""
+
+
+@dataclass(frozen=True)
+class PriceAccept(Message):
+    """Price accept message (0x16).
+
+    Sent to accept a PriceOffer and lock in pricing terms.
+
+    Attributes:
+        request_id: Correlates to the original PriceRequest.
+        offer_signature: Echoes the PriceOffer.signature being accepted.
+        resource_type: Type of resource being priced.
+        unit_price: Accepted price per unit.
+        currency: Currency identifier.
+        valid_from: Unix timestamp for start of validity.
+        valid_until: Unix timestamp for end of validity.
+        signature: ML-DSA-65 signature from the accepter.
+    """
+
+    message_type: MessageType = field(default=MessageType.PRICE_ACCEPT, init=False)
+    request_id: bytes = b""
+    offer_signature: bytes = b""
+    resource_type: str = ""
+    unit_price: int = 0
+    currency: str = ""
+    valid_from: int = 0
+    valid_until: int = 0
+    signature: bytes = b""
+
+
+# =============================================================================
+# Cross-Domain Delegation Messages (0x17-0x18)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DelegationRequest(Message):
+    """Delegation request message (0x17).
+
+    Sent to request cross-domain delegation of a capability.
+
+    Attributes:
+        request_id: Unique request identifier.
+        attenuated_token: CBOR-encoded attenuated capability token.
+        delegation_chain: CBOR-encoded delegation chain.
+        source_binding: CBOR-encoded source owner binding.
+        endorsement: CBOR-encoded owner endorsement.
+        target_owner_did: DID of the target owner.
+        target_agent_did: DID of the target agent.
+    """
+
+    message_type: MessageType = field(default=MessageType.DELEGATION_REQUEST, init=False)
+    request_id: bytes = b""
+    attenuated_token: bytes = b""
+    delegation_chain: bytes = b""
+    source_binding: bytes = b""
+    endorsement: bytes = b""
+    target_owner_did: str = ""
+    target_agent_did: str = ""
+
+
+@dataclass(frozen=True)
+class DelegationGrant(Message):
+    """Delegation grant message (0x18).
+
+    Sent in response to a DelegationRequest.
+
+    Attributes:
+        request_id: Matching request identifier.
+        acceptance: CBOR-encoded owner acceptance.
+        target_binding: CBOR-encoded target owner binding.
+        delegation_id: Unique delegation identifier.
+        status: 0 for accepted, 1 for rejected.
+        rejection_reason: Reason for rejection (if status=1).
+    """
+
+    message_type: MessageType = field(default=MessageType.DELEGATION_GRANT, init=False)
+    request_id: bytes = b""
+    acceptance: bytes = b""
+    target_binding: bytes = b""
+    delegation_id: bytes = b""
+    status: int = 0
+    rejection_reason: str = ""
+
+
+# =============================================================================
+# Reconciliation Messages (0x19-0x1A)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ReconciliationRequest(Message):
+    """Reconciliation request message (0x19).
+
+    Sent to initiate pre-dispute reconciliation when a metering
+    divergence is detected between agent and server.
+
+    Attributes:
+        meter_id: Meter identifier for the divergent resource.
+        start_seq: Start sequence number of the receipt range.
+        end_seq: End sequence number of the receipt range.
+        chain_cbor: CBOR-encoded bounded receipt chain.
+        detected_cost_diff: Detected cost difference (absolute).
+        timestamp: Request timestamp.
+        signature: ML-DSA-65 signature over request fields.
+    """
+
+    message_type: MessageType = field(
+        default=MessageType.RECONCILIATION_REQUEST, init=False,
+    )
+    meter_id: bytes = b""
+    start_seq: int = 0
+    end_seq: int = 0
+    chain_cbor: bytes = b""
+    detected_cost_diff: int = 0
+    timestamp: int = 0
+    signature: bytes = b""
+
+
+@dataclass(frozen=True)
+class ReconciliationResponse(Message):
+    """Reconciliation response message (0x1A).
+
+    Sent in response to a ReconciliationRequest with the resolution outcome.
+
+    Attributes:
+        meter_id: Meter identifier for the divergent resource.
+        start_seq: Start sequence number of the receipt range.
+        end_seq: End sequence number of the receipt range.
+        chain_cbor: CBOR-encoded bounded receipt chain (responder's view).
+        resolution: Resolution method (0=agreed, 1=higher_seq_wins,
+            2=use_average, 3=failed).
+        agreed_cost: Agreed cost after resolution.
+        timestamp: Response timestamp.
+        signature: ML-DSA-65 signature over response fields.
+    """
+
+    message_type: MessageType = field(
+        default=MessageType.RECONCILIATION_RESPONSE, init=False,
+    )
+    meter_id: bytes = b""
+    start_seq: int = 0
+    end_seq: int = 0
+    chain_cbor: bytes = b""
+    resolution: int = 0
+    agreed_cost: int = 0
+    timestamp: int = 0
+    signature: bytes = b""
+
+
+# =============================================================================
+# OCSP Messages (0x1B-0x1C)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class OCSPRequestMessage(Message):
+    """OCSP request message (0x1B).
+
+    Sent to query real-time revocation status of a capability token.
+
+    Attributes:
+        token_id: Identifier of the token to check.
+        nonce: Random nonce for replay protection.
+    """
+
+    message_type: MessageType = field(default=MessageType.OCSP_REQUEST, init=False)
+    token_id: bytes = b""
+    nonce: bytes = b""
+
+
+@dataclass(frozen=True)
+class OCSPResponseMessage(Message):
+    """OCSP response message (0x1C).
+
+    Returns real-time revocation status with a signed proof.
+
+    Attributes:
+        status: OCSP status (0=good, 1=revoked, 2=unknown).
+        token_id: Identifier of the queried token.
+        this_update: Unix timestamp when status was determined.
+        next_update: Unix timestamp when status expires.
+        responder_id: DID of the OCSP responder.
+        nonce: Echoed nonce from the request.
+        signature: ML-DSA-65 signature over response data.
+        revocation_reason: Revocation reason code (if revoked).
+        revocation_time: Unix timestamp of revocation (if revoked).
+    """
+
+    message_type: MessageType = field(default=MessageType.OCSP_RESPONSE, init=False)
+    status: int = 0
+    token_id: bytes = b""
+    this_update: int = 0
+    next_update: int = 0
+    responder_id: str = ""
+    nonce: bytes = b""
+    signature: bytes = b""
+    revocation_reason: int | None = None
+    revocation_time: int | None = None

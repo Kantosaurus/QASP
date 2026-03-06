@@ -286,6 +286,41 @@ class TrustRegistry:
             self._entries[did_string] = updated_entry
             return updated_entry
 
+    def update_behavioral_score(self, did: DID | str, new_score: float) -> TrustEntry:
+        """Replace the behavioral_score on a TrustEntry.
+
+        Used by fault attribution to penalize parties found at fault.
+        Creates a new frozen TrustEntry with the updated score.
+
+        Args:
+            did: The agent's DID.
+            new_score: The new behavioral score (0-1).
+
+        Returns:
+            The updated trust entry.
+
+        Raises:
+            EntryNotFoundError: If no entry exists for this DID.
+        """
+        did_string = str(did) if isinstance(did, DID) else did
+        with self._lock:
+            entry = self.get(did_string)
+
+            updated_entry = TrustEntry(
+                did=entry.did,
+                reputation_alpha=entry.reputation_alpha,
+                reputation_beta=entry.reputation_beta,
+                audit_vcs=entry.audit_vcs,
+                behavioral_score=max(0.0, min(1.0, new_score)),
+                total_interactions=entry.total_interactions,
+                successful_interactions=entry.successful_interactions,
+                last_interaction=entry.last_interaction,
+                flags=entry.flags,
+            )
+
+            self._entries[did_string] = updated_entry
+            return updated_entry
+
     def remove_flag(self, did: DID | str, flag: str) -> TrustEntry:
         """Remove a flag from an agent's entry.
 

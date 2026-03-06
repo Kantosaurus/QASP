@@ -207,6 +207,7 @@ class TestReceiptChainVerification:
         tampered = Receipt(
             records=original.records,
             total_units=999,
+            total_cost=original.total_cost,
             issued_at=original.issued_at,
             issuer=original.issuer,
             signature=original.signature,

@@ -38,6 +38,9 @@ __all__ = [
     "MultiOwnerCapabilityToken",
     "MultiOwnerValidationError",
     "RevocationChecker",
+    "TemporalSchedule",
+    "TemporalScheduleError",
+    "TemporalThreshold",
     "TokenConstraintViolation",
     "TokenExpiredError",
     "TokenNotYetValidError",
@@ -49,8 +52,12 @@ __all__ = [
     "create_multi_owner_token",
     "create_sub_invocation_token",
     "create_token",
+    "evaluate_temporal_constraints",
+    "exponential_decay_schedule",
     "intersect_constraints",
+    "linear_decay_schedule",
     "split_token",
+    "step_schedule",
     "verify_delegation_chain",
     "verify_multi_owner_token",
     "verify_token",
@@ -134,6 +141,12 @@ class TokenRevokedError(CapabilityError):
     """Raised when a revoked token is used."""
 
     alert_code: int = 56
+
+
+class TemporalScheduleError(CapabilityError):
+    """Raised when a temporal attenuation schedule is invalid."""
+
+    alert_code: int = 57
 
 
 # =============================================================================
@@ -420,6 +433,48 @@ def _is_contiguous_sublist(child: tuple[str, ...], parent: tuple[str, ...]) -> b
     return False
 
 
+@dataclass(frozen=True)
+class TemporalThreshold:
+    """A single point in a temporal decay schedule.
+
+    Attributes:
+        at_seconds: Seconds after token issued_at when this threshold applies.
+        max_spend: Override for max_spend at this time point (None = no override).
+        quantity_limit: Override for quantity_limit at this time point.
+        rate_limit: Override for rate_limit at this time point.
+    """
+
+    at_seconds: int
+    max_spend: int | None = None
+    quantity_limit: int | None = None
+    rate_limit: int | None = None
+
+
+@dataclass(frozen=True)
+class TemporalSchedule:
+    """A temporal attenuation schedule for capability tokens.
+
+    Thresholds must be sorted by at_seconds ascending. Each threshold
+    specifies reduced numeric constraints that take effect at that time offset.
+
+    Attributes:
+        thresholds: Ordered tuple of temporal thresholds.
+        policy: Label describing the generation policy (informational only).
+    """
+
+    thresholds: tuple[TemporalThreshold, ...]
+    policy: str = ""
+
+    def __post_init__(self) -> None:
+        if len(self.thresholds) > 1:
+            for i in range(1, len(self.thresholds)):
+                if self.thresholds[i].at_seconds <= self.thresholds[i - 1].at_seconds:
+                    raise TemporalScheduleError(
+                        f"Thresholds must be sorted by at_seconds ascending: "
+                        f"{self.thresholds[i - 1].at_seconds} >= {self.thresholds[i].at_seconds}"
+                    )
+
+
 @dataclass
 class TokenUsage:
     """Runtime tracking for constraint verification.
@@ -480,6 +535,8 @@ class CapabilityToken:
     max_delegation_depth: int = 0
     delegation_chain_length: int = 0
     toolchain_position: int = 0
+    auditor_kem_pk: bytes | None = None
+    temporal_attenuation: TemporalSchedule | None = None
 
     def to_cbor(self) -> bytes:
         """Serialize the token to CBOR (without signature for verification).
@@ -501,6 +558,8 @@ class CapabilityToken:
             max_delegation_depth=self.max_delegation_depth,
             delegation_chain_length=self.delegation_chain_length,
             toolchain_position=self.toolchain_position,
+            auditor_kem_pk=self.auditor_kem_pk,
+            temporal_attenuation=self.temporal_attenuation,
         )
 
     def compute_hash(self) -> bytes:
@@ -598,6 +657,13 @@ class CapabilityToken:
                 ),
             )
 
+            # Parse temporal attenuation
+            temporal_attenuation = None
+            if decoded.get("temporal_attenuation"):
+                temporal_attenuation = _dict_to_temporal_schedule(
+                    decoded["temporal_attenuation"]
+                )
+
             return cls(
                 token_id=bytes.fromhex(decoded["token_id"]),
                 issuer_did=issuer_did,
@@ -615,6 +681,12 @@ class CapabilityToken:
                 max_delegation_depth=decoded.get("max_depth", 0),
                 delegation_chain_length=decoded.get("chain_len", 0),
                 toolchain_position=decoded.get("tc_pos", 0),
+                auditor_kem_pk=(
+                    bytes.fromhex(decoded["auditor_kem_pk"])
+                    if decoded.get("auditor_kem_pk")
+                    else None
+                ),
+                temporal_attenuation=temporal_attenuation,
             )
         except (KeyError, ValueError, TypeError, cbor2.CBORDecodeError) as e:
             raise InvalidTokenError(f"Failed to parse token CBOR: {e}") from e
@@ -640,6 +712,8 @@ class CapabilityToken:
             max_delegation_depth=self.max_delegation_depth,
             delegation_chain_length=self.delegation_chain_length,
             toolchain_position=self.toolchain_position,
+            auditor_kem_pk=self.auditor_kem_pk,
+            temporal_attenuation=self.temporal_attenuation,
         )
 
 
@@ -682,6 +756,41 @@ def _constraints_to_dict(constraints: Constraints) -> dict[str, Any]:
     return result
 
 
+def _temporal_schedule_to_dict(schedule: TemporalSchedule) -> dict[str, Any]:
+    """Convert a TemporalSchedule to a dictionary for CBOR encoding."""
+    thresholds = []
+    for t in schedule.thresholds:
+        entry: dict[str, Any] = {"at_seconds": t.at_seconds}
+        if t.max_spend is not None:
+            entry["max_spend"] = t.max_spend
+        if t.quantity_limit is not None:
+            entry["quantity_limit"] = t.quantity_limit
+        if t.rate_limit is not None:
+            entry["rate_limit"] = t.rate_limit
+        thresholds.append(entry)
+    result: dict[str, Any] = {"thresholds": thresholds}
+    if schedule.policy:
+        result["policy"] = schedule.policy
+    return result
+
+
+def _dict_to_temporal_schedule(data: dict[str, Any]) -> TemporalSchedule:
+    """Parse a TemporalSchedule from a CBOR-decoded dictionary."""
+    thresholds = tuple(
+        TemporalThreshold(
+            at_seconds=t["at_seconds"],
+            max_spend=t.get("max_spend"),
+            quantity_limit=t.get("quantity_limit"),
+            rate_limit=t.get("rate_limit"),
+        )
+        for t in data["thresholds"]
+    )
+    return TemporalSchedule(
+        thresholds=thresholds,
+        policy=data.get("policy", ""),
+    )
+
+
 def _encode_token_data(
     token_id: bytes,
     issuer_did: DID,
@@ -696,6 +805,8 @@ def _encode_token_data(
     max_delegation_depth: int,
     delegation_chain_length: int,
     toolchain_position: int = 0,
+    auditor_kem_pk: bytes | None = None,
+    temporal_attenuation: TemporalSchedule | None = None,
 ) -> bytes:
     """Encode token data to CBOR for signing.
 
@@ -713,6 +824,8 @@ def _encode_token_data(
         max_delegation_depth: Maximum delegation depth.
         delegation_chain_length: Current chain length.
         toolchain_position: Current position in the toolchain.
+        auditor_kem_pk: Optional auditor ML-KEM-768 public key.
+        temporal_attenuation: Optional temporal decay schedule.
 
     Returns:
         CBOR-encoded bytes.
@@ -732,6 +845,10 @@ def _encode_token_data(
         "chain_len": delegation_chain_length,
         "tc_pos": toolchain_position,
     }
+    if auditor_kem_pk:
+        token_data["auditor_kem_pk"] = auditor_kem_pk.hex()
+    if temporal_attenuation is not None:
+        token_data["temporal_attenuation"] = _temporal_schedule_to_dict(temporal_attenuation)
     return cbor2.dumps(token_data)
 
 
@@ -750,6 +867,8 @@ def _encode_token_data_with_signature(
     max_delegation_depth: int,
     delegation_chain_length: int,
     toolchain_position: int = 0,
+    auditor_kem_pk: bytes | None = None,
+    temporal_attenuation: TemporalSchedule | None = None,
 ) -> bytes:
     """Encode token data with signature to CBOR.
 
@@ -775,6 +894,10 @@ def _encode_token_data_with_signature(
         "chain_len": delegation_chain_length,
         "tc_pos": toolchain_position,
     }
+    if auditor_kem_pk:
+        token_data["auditor_kem_pk"] = auditor_kem_pk.hex()
+    if temporal_attenuation is not None:
+        token_data["temporal_attenuation"] = _temporal_schedule_to_dict(temporal_attenuation)
     return cbor2.dumps(token_data)
 
 
@@ -793,6 +916,8 @@ def create_token(
     audience_did: DID | None = None,
     max_delegation_depth: int = 0,
     validity_seconds: int = DEFAULT_VALIDITY_SECONDS,
+    auditor_kem_pk: bytes | None = None,
+    temporal_attenuation: TemporalSchedule | None = None,
 ) -> CapabilityToken:
     """Create a new capability token.
 
@@ -858,6 +983,8 @@ def create_token(
         max_delegation_depth=max_delegation_depth,
         delegation_chain_length=0,
         toolchain_position=0,
+        auditor_kem_pk=auditor_kem_pk,
+        temporal_attenuation=temporal_attenuation,
     )
     signature = sign(issuer_secret_key, message)
 
@@ -876,6 +1003,8 @@ def create_token(
         max_delegation_depth=max_delegation_depth,
         delegation_chain_length=0,
         toolchain_position=0,
+        auditor_kem_pk=auditor_kem_pk,
+        temporal_attenuation=temporal_attenuation,
     )
 
 
@@ -938,24 +1067,34 @@ def verify_token(
                 f"Token expired at {token.constraints.not_after}"
             )
 
+    # Evaluate temporal attenuation
+    effective_constraints = token.constraints
+    if token.temporal_attenuation is not None:
+        effective_constraints = evaluate_temporal_constraints(token)
+
     # Check usage constraints if provided
     if usage is not None:
-        _verify_usage_constraints(token, usage)
+        _verify_usage_constraints(token, usage, effective_constraints=effective_constraints)
 
     return True
 
 
-def _verify_usage_constraints(token: CapabilityToken, usage: TokenUsage) -> None:
+def _verify_usage_constraints(
+    token: CapabilityToken,
+    usage: TokenUsage,
+    effective_constraints: Constraints | None = None,
+) -> None:
     """Verify that usage complies with token constraints.
 
     Args:
         token: The token with constraints.
         usage: The current usage tracking.
+        effective_constraints: Optional override constraints (e.g. after temporal decay).
 
     Raises:
         TokenConstraintViolation: If any constraint is violated.
     """
-    constraints = token.constraints
+    constraints = effective_constraints if effective_constraints is not None else token.constraints
 
     # Check quantity limit
     if (
@@ -1023,8 +1162,158 @@ def _verify_usage_constraints(token: CapabilityToken, usage: TokenUsage) -> None
 
 
 # =============================================================================
+# Temporal Constraint Evaluation
+# =============================================================================
+
+
+def evaluate_temporal_constraints_raw(
+    base_constraints: Constraints,
+    schedule: TemporalSchedule,
+    issued_at: datetime,
+    current_time: datetime | None = None,
+) -> Constraints:
+    """Evaluate temporal attenuation against base constraints.
+
+    Finds the latest applicable threshold and returns constraints with
+    effective numeric values = min(base, threshold) for each field.
+
+    Args:
+        base_constraints: The token's base constraints.
+        schedule: The temporal decay schedule.
+        issued_at: When the token was issued.
+        current_time: Current time (defaults to UTC now).
+
+    Returns:
+        Constraints with temporally attenuated numeric fields.
+    """
+    if not schedule.thresholds:
+        return base_constraints
+
+    if current_time is None:
+        current_time = datetime.now(UTC)
+
+    elapsed = (current_time - issued_at).total_seconds()
+
+    # Clock skew or before any threshold
+    if elapsed < 0:
+        return base_constraints
+
+    # Find latest applicable threshold
+    active_threshold: TemporalThreshold | None = None
+    for threshold in schedule.thresholds:
+        if threshold.at_seconds <= elapsed:
+            active_threshold = threshold
+        else:
+            break
+
+    if active_threshold is None:
+        return base_constraints
+
+    # Compute effective values: min(base, threshold) where threshold is not None
+    def _min_or_base(base_val: int | None, thresh_val: int | None) -> int | None:
+        if thresh_val is None:
+            return base_val
+        if base_val is None:
+            return thresh_val
+        return min(base_val, thresh_val)
+
+    return Constraints(
+        not_before=base_constraints.not_before,
+        not_after=base_constraints.not_after,
+        quantity_limit=_min_or_base(base_constraints.quantity_limit, active_threshold.quantity_limit),
+        quantity_unit=base_constraints.quantity_unit,
+        rate_limit=_min_or_base(base_constraints.rate_limit, active_threshold.rate_limit),
+        rate_period_seconds=base_constraints.rate_period_seconds,
+        max_spend=_min_or_base(base_constraints.max_spend, active_threshold.max_spend),
+        spend_currency=base_constraints.spend_currency,
+        data_scope=base_constraints.data_scope,
+        purpose=base_constraints.purpose,
+        allowed_toolchain=base_constraints.allowed_toolchain,
+    )
+
+
+def evaluate_temporal_constraints(
+    token: CapabilityToken,
+    current_time: datetime | None = None,
+) -> Constraints:
+    """Evaluate temporal attenuation for a token.
+
+    Args:
+        token: The token with optional temporal_attenuation.
+        current_time: Current time (defaults to UTC now).
+
+    Returns:
+        Effective constraints after temporal decay.
+    """
+    if token.temporal_attenuation is None:
+        return token.constraints
+    return evaluate_temporal_constraints_raw(
+        token.constraints, token.temporal_attenuation, token.issued_at, current_time,
+    )
+
+
+# =============================================================================
 # Token Attenuation
 # =============================================================================
+
+
+def _verify_temporal_monotonicity(
+    parent_token: CapabilityToken,
+    child_constraints: Constraints,
+    child_temporal: TemporalSchedule | None,
+) -> None:
+    """Verify that child temporal schedule is at least as restrictive as parent.
+
+    Checks all unique time points from both schedules and verifies
+    the child's effective constraints are <= parent's at each point.
+
+    Raises:
+        AttenuationError: If any time point violates monotonicity.
+    """
+    parent_temporal = parent_token.temporal_attenuation
+    if parent_temporal is None and child_temporal is None:
+        return
+
+    # Collect all unique time points to check
+    time_points: set[int] = {0}
+    if parent_temporal is not None:
+        for t in parent_temporal.thresholds:
+            time_points.add(t.at_seconds)
+    if child_temporal is not None:
+        for t in child_temporal.thresholds:
+            time_points.add(t.at_seconds)
+
+    # Use a synthetic issued_at as epoch reference
+    epoch = datetime(2000, 1, 1, tzinfo=UTC)
+
+    for seconds in sorted(time_points):
+        check_time = epoch + timedelta(seconds=seconds)
+
+        # Compute parent effective constraints at this time
+        if parent_temporal is not None:
+            parent_effective = evaluate_temporal_constraints_raw(
+                parent_token.constraints, parent_temporal, epoch, check_time,
+            )
+        else:
+            parent_effective = parent_token.constraints
+
+        # Compute child effective constraints at this time
+        if child_temporal is not None:
+            child_effective = evaluate_temporal_constraints_raw(
+                child_constraints, child_temporal, epoch, check_time,
+            )
+        else:
+            child_effective = child_constraints
+
+        # Check each numeric field: child must be <= parent (or both None)
+        for field_name in ("max_spend", "quantity_limit", "rate_limit"):
+            parent_val = getattr(parent_effective, field_name)
+            child_val = getattr(child_effective, field_name)
+            if parent_val is not None and (child_val is None or child_val > parent_val):
+                raise AttenuationError(
+                    f"Temporal monotonicity violation at t={seconds}s: "
+                    f"child {field_name}={child_val} exceeds parent {field_name}={parent_val}"
+                )
 
 
 def attenuate_token(
@@ -1034,6 +1323,7 @@ def attenuate_token(
     reduced_verbs: VerbSet | None = None,
     tightened_constraints: Constraints | None = None,
     toolchain_position: int | None = None,
+    temporal_attenuation: TemporalSchedule | None = None,
 ) -> CapabilityToken:
     """Create an attenuated token from a parent token.
 
@@ -1046,6 +1336,7 @@ def attenuate_token(
         reduced_verbs: New verb set (must be subset of parent).
         tightened_constraints: Additional constraint tightening.
         toolchain_position: Toolchain position override (defaults to parent's).
+        temporal_attenuation: Optional temporal decay schedule for the child token.
 
     Returns:
         A new attenuated CapabilityToken.
@@ -1090,6 +1381,15 @@ def attenuate_token(
     else:
         new_tc_pos = parent_token.toolchain_position
 
+    # Determine temporal attenuation: inherit parent's if child doesn't specify one
+    new_temporal = temporal_attenuation
+    if new_temporal is None and parent_token.temporal_attenuation is not None:
+        new_temporal = parent_token.temporal_attenuation
+
+    # Verify temporal monotonicity
+    if parent_token.temporal_attenuation is not None or new_temporal is not None:
+        _verify_temporal_monotonicity(parent_token, new_constraints, new_temporal)
+
     # Generate new token
     nonce = os.urandom(NONCE_SIZE)
     token_id = hashlib.sha384(str(parent_token.subject_did).encode() + nonce).digest()[:32]
@@ -1113,6 +1413,8 @@ def attenuate_token(
         max_delegation_depth=new_depth,
         delegation_chain_length=new_chain_length,
         toolchain_position=new_tc_pos,
+        auditor_kem_pk=parent_token.auditor_kem_pk,
+        temporal_attenuation=new_temporal,
     )
     signature = sign(delegator_secret_key, message)
 
@@ -1131,6 +1433,8 @@ def attenuate_token(
         max_delegation_depth=new_depth,
         delegation_chain_length=new_chain_length,
         toolchain_position=new_tc_pos,
+        auditor_kem_pk=parent_token.auditor_kem_pk,
+        temporal_attenuation=new_temporal,
     )
 
 
@@ -1141,6 +1445,7 @@ def create_sub_invocation_token(
     new_subject_did: DID,
     reduced_verbs: VerbSet | None = None,
     tightened_constraints: Constraints | None = None,
+    temporal_attenuation: TemporalSchedule | None = None,
 ) -> CapabilityToken:
     """Create a sub-invocation token for capability firebreaks.
 
@@ -1154,6 +1459,7 @@ def create_sub_invocation_token(
         new_subject_did: The DID of the sub-invocation target.
         reduced_verbs: Optional reduced verb set.
         tightened_constraints: Optional tightened constraints.
+        temporal_attenuation: Optional temporal decay schedule.
 
     Returns:
         A new CapabilityToken with advanced toolchain position.
@@ -1186,6 +1492,7 @@ def create_sub_invocation_token(
         reduced_verbs=reduced_verbs,
         tightened_constraints=tightened_constraints,
         toolchain_position=new_position,
+        temporal_attenuation=temporal_attenuation,
     )
 
 
@@ -1379,6 +1686,17 @@ def verify_delegation_chain(
                 f"Token {i} constraints are not tighter than parent"
             )
 
+        # Check temporal monotonicity
+        if prev_token.temporal_attenuation is not None or token.temporal_attenuation is not None:
+            try:
+                _verify_temporal_monotonicity(
+                    prev_token, token.constraints, token.temporal_attenuation,
+                )
+            except AttenuationError as e:
+                raise InvalidDelegationChainError(
+                    f"Token {i} temporal monotonicity violation: {e}"
+                ) from e
+
         # Verify issuer is previous subject
         if token.issuer_did != prev_token.subject_did:
             raise InvalidDelegationChainError(
@@ -1410,6 +1728,110 @@ def verify_delegation_chain(
         prev_token = token
 
     return True
+
+
+# =============================================================================
+# Temporal Policy Helpers
+# =============================================================================
+
+
+def linear_decay_schedule(
+    initial_max_spend: int | None = None,
+    initial_quantity_limit: int | None = None,
+    initial_rate_limit: int | None = None,
+    duration_seconds: int = 3600,
+    steps: int = 10,
+) -> TemporalSchedule:
+    """Generate a linear decay schedule.
+
+    Creates thresholds where each value decreases linearly from the initial
+    value down to zero over the specified duration.
+
+    Args:
+        initial_max_spend: Starting max_spend value.
+        initial_quantity_limit: Starting quantity_limit value.
+        initial_rate_limit: Starting rate_limit value.
+        duration_seconds: Total duration for the decay.
+        steps: Number of threshold steps.
+
+    Returns:
+        A TemporalSchedule with linearly decaying thresholds.
+    """
+    thresholds = []
+    for i in range(1, steps + 1):
+        at_seconds = (duration_seconds * i) // steps
+        factor = 1.0 - (i / steps)
+
+        ms = int(initial_max_spend * factor) if initial_max_spend is not None else None
+        ql = int(initial_quantity_limit * factor) if initial_quantity_limit is not None else None
+        rl = int(initial_rate_limit * factor) if initial_rate_limit is not None else None
+
+        thresholds.append(TemporalThreshold(
+            at_seconds=at_seconds,
+            max_spend=ms,
+            quantity_limit=ql,
+            rate_limit=rl,
+        ))
+    return TemporalSchedule(thresholds=tuple(thresholds), policy="linear_decay")
+
+
+def exponential_decay_schedule(
+    initial_max_spend: int | None = None,
+    initial_quantity_limit: int | None = None,
+    initial_rate_limit: int | None = None,
+    half_life_seconds: int = 1800,
+    duration_seconds: int = 3600,
+    steps: int = 10,
+) -> TemporalSchedule:
+    """Generate an exponential decay schedule.
+
+    Creates thresholds where each value decays exponentially with the
+    given half-life.
+
+    Args:
+        initial_max_spend: Starting max_spend value.
+        initial_quantity_limit: Starting quantity_limit value.
+        initial_rate_limit: Starting rate_limit value.
+        half_life_seconds: Time for values to halve.
+        duration_seconds: Total duration for the decay.
+        steps: Number of threshold steps.
+
+    Returns:
+        A TemporalSchedule with exponentially decaying thresholds.
+    """
+    import math
+
+    thresholds = []
+    for i in range(1, steps + 1):
+        at_seconds = (duration_seconds * i) // steps
+        factor = math.pow(2, -at_seconds / half_life_seconds)
+
+        ms = int(initial_max_spend * factor) if initial_max_spend is not None else None
+        ql = int(initial_quantity_limit * factor) if initial_quantity_limit is not None else None
+        rl = int(initial_rate_limit * factor) if initial_rate_limit is not None else None
+
+        thresholds.append(TemporalThreshold(
+            at_seconds=at_seconds,
+            max_spend=ms,
+            quantity_limit=ql,
+            rate_limit=rl,
+        ))
+    return TemporalSchedule(thresholds=tuple(thresholds), policy="exponential")
+
+
+def step_schedule(thresholds: list[TemporalThreshold]) -> TemporalSchedule:
+    """Create a step schedule from explicit thresholds.
+
+    Args:
+        thresholds: List of temporal thresholds (will be validated for ordering).
+
+    Returns:
+        A TemporalSchedule wrapping the thresholds.
+
+    Raises:
+        TemporalScheduleError: If thresholds are not sorted by at_seconds.
+    """
+    return TemporalSchedule(thresholds=tuple(thresholds), policy="step")
 
 
 # =============================================================================

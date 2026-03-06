@@ -473,33 +473,60 @@ class TestPaymentChannelIntegration:
         agent_b_secret_key: bytes,
         agent_b_public_key: bytes,
     ) -> None:
-        channel = PaymentChannel(
-            party_a=str(agent_a_did),
-            party_b=str(agent_b_did),
-            initial_balance_a=1000,
-            initial_balance_b=500,
+        from qasp.protocol.settlement import (
+            CLOSE_REASON_COOPERATIVE,
+            InsufficientBalanceError,
         )
 
-        assert channel.state == ChannelState.OPENING
+        agent_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
+        )
+        server_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
+        )
 
-        channel_id = channel.open(agent_a_secret_key, agent_b_secret_key)
-        assert channel.state == ChannelState.OPEN
-        assert len(channel_id) == 32
+        assert agent_ch.state == ChannelState.OPENING
 
-        channel.transfer(100, from_a_to_b=True, signing_key=agent_a_secret_key)
-        assert channel.balance_a == 900
-        assert channel.balance_b == 600
+        open_msg, _ = agent_ch.create_channel_open(1000)
+        response, _ = server_ch.process_channel_open(open_msg, 500)
+        agent_ch.accept_channel(response)
 
-        channel.transfer(50, from_a_to_b=False, signing_key=agent_b_secret_key)
-        assert channel.balance_a == 950
-        assert channel.balance_b == 550
+        assert agent_ch.state == ChannelState.OPEN
+        assert len(agent_ch.channel_id) == 32
 
-        settlement = channel.close(agent_a_secret_key, agent_b_secret_key)
-        assert channel.state == ChannelState.CLOSED
-        assert settlement.channel_id == channel_id
-        assert settlement.amount == 50  # net: A lost 50
-        assert settlement.payer == str(agent_a_did)
-        assert settlement.payee == str(agent_b_did)
+        # Transfer 100 from agent to server
+        update, _ = agent_ch.create_state_update(
+            100, agent_a_secret_key,
+        )
+        signed, _ = server_ch.countersign_state_update(
+            update, agent_b_secret_key,
+        )
+        agent_ch.apply_state_update(signed)
+        assert agent_ch.agent_balance == 900
+        assert agent_ch.server_balance == 600
+
+        # Transfer 50 from server to agent
+        update, _ = server_ch.create_state_update(
+            50, agent_b_secret_key, from_agent_to_server=False,
+        )
+        signed, _ = agent_ch.countersign_state_update(
+            update, agent_a_secret_key,
+        )
+        server_ch.apply_state_update(signed)
+        assert agent_ch.agent_balance == 950
+        assert agent_ch.server_balance == 550
+
+        # Cooperative close
+        close_msg, _ = agent_ch.create_channel_close(agent_a_secret_key)
+        assert close_msg.close_reason == CLOSE_REASON_COOPERATIVE
+        signed_close, _ = server_ch.countersign_close(
+            close_msg, agent_b_secret_key,
+        )
+        assert server_ch.state == ChannelState.CLOSED
+        assert signed_close.final_balance_a == 950
+        assert signed_close.final_balance_b == 550
 
     def test_payment_channel_linked_to_receipt_chain(
         self,
@@ -508,20 +535,23 @@ class TestPaymentChannelIntegration:
         agent_a_public_key: bytes,
         agent_b_did: DID,
         agent_b_secret_key: bytes,
+        agent_b_public_key: bytes,
     ) -> None:
-        # Set up metering alongside payment channel
         meter = Meter(session_id=b"payment-session", issuer=str(agent_a_did))
         chain = ReceiptChain()
 
-        channel = PaymentChannel(
-            party_a=str(agent_a_did),
-            party_b=str(agent_b_did),
-            initial_balance_a=1000,
-            initial_balance_b=0,
+        agent_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
         )
-        channel.open(agent_a_secret_key, agent_b_secret_key)
+        server_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
+        )
+        open_msg, _ = agent_ch.create_channel_open(1000)
+        response, _ = server_ch.process_channel_open(open_msg, 0)
+        agent_ch.accept_channel(response)
 
-        # Record usage and transfer payment
         prev_hash = b""
         for i in range(3):
             meter.record("compute", "inference", units=10)
@@ -529,65 +559,94 @@ class TestPaymentChannelIntegration:
             chain.append(receipt)
             prev_hash = receipt.compute_hash()
 
-            channel.transfer(10, from_a_to_b=True, signing_key=agent_a_secret_key)
+            update, _ = agent_ch.create_state_update(
+                10, agent_a_secret_key,
+            )
+            signed, _ = server_ch.countersign_state_update(
+                update, agent_b_secret_key,
+            )
+            agent_ch.apply_state_update(signed)
 
-        # Verify receipt chain matches payment transfers
         assert chain.verify(agent_a_public_key)
         assert len(chain) == 3
-        assert channel.balance_a == 970
-        assert channel.balance_b == 30
+        assert agent_ch.agent_balance == 970
+        assert agent_ch.server_balance == 30
 
     def test_payment_channel_state_hash_chain(
         self,
         agent_a_did: DID,
         agent_a_secret_key: bytes,
+        agent_a_public_key: bytes,
         agent_b_did: DID,
         agent_b_secret_key: bytes,
+        agent_b_public_key: bytes,
     ) -> None:
-        channel = PaymentChannel(
-            party_a=str(agent_a_did),
-            party_b=str(agent_b_did),
-            initial_balance_a=500,
-            initial_balance_b=500,
+        from qasp.protocol.settlement import ChannelStateUpdate
+
+        agent_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
         )
-        channel.open(agent_a_secret_key, agent_b_secret_key)
+        server_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
+        )
+        open_msg, _ = agent_ch.create_channel_open(500)
+        response, _ = server_ch.process_channel_open(open_msg, 500)
+        agent_ch.accept_channel(response)
 
+        updates: list[ChannelStateUpdate] = []
         for i in range(5):
-            channel.transfer(10, from_a_to_b=True, signing_key=agent_a_secret_key)
+            update, _ = agent_ch.create_state_update(
+                10, agent_a_secret_key,
+            )
+            signed, _ = server_ch.countersign_state_update(
+                update, agent_b_secret_key,
+            )
+            agent_ch.apply_state_update(signed)
+            updates.append(signed)
 
-        states = channel.states
-        assert len(states) == 6  # 1 open + 5 transfers
+        assert len(updates) == 5
 
-        # Verify hash chain: each state's prev_state_hash matches previous state's hash
-        for i in range(1, len(states)):
-            expected_hash = states[i - 1].compute_hash()
-            assert states[i].prev_state_hash == expected_hash, (
-                f"State {i} prev_state_hash mismatch"
+        # Verify hash chain
+        for i in range(1, len(updates)):
+            expected_hash = updates[i - 1].compute_hash()
+            assert updates[i].prev_hash == expected_hash, (
+                f"State {i} prev_hash mismatch"
             )
 
     def test_payment_channel_insufficient_balance_rejected(
         self,
         agent_a_did: DID,
         agent_a_secret_key: bytes,
+        agent_a_public_key: bytes,
         agent_b_did: DID,
         agent_b_secret_key: bytes,
+        agent_b_public_key: bytes,
     ) -> None:
-        channel = PaymentChannel(
-            party_a=str(agent_a_did),
-            party_b=str(agent_b_did),
-            initial_balance_a=100,
-            initial_balance_b=50,
+        from qasp.protocol.settlement import InsufficientBalanceError
+
+        agent_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
         )
-        channel.open(agent_a_secret_key, agent_b_secret_key)
+        server_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
+        )
+        open_msg, _ = agent_ch.create_channel_open(100)
+        response, _ = server_ch.process_channel_open(open_msg, 50)
+        agent_ch.accept_channel(response)
 
-        with pytest.raises(ValueError, match="Insufficient balance"):
-            channel.transfer(200, from_a_to_b=True, signing_key=agent_a_secret_key)
+        with pytest.raises(InsufficientBalanceError):
+            agent_ch.create_state_update(
+                200, agent_a_secret_key,
+            )
 
-        # Balance should be unchanged after failed transfer
-        assert channel.balance_a == 100
-        assert channel.balance_b == 50
+        assert agent_ch.agent_balance == 100
+        assert agent_ch.server_balance == 50
 
-    def test_payment_settlement_signatures_verifiable(
+    def test_payment_channel_signatures_verifiable(
         self,
         agent_a_did: DID,
         agent_a_secret_key: bytes,
@@ -598,21 +657,27 @@ class TestPaymentChannelIntegration:
     ) -> None:
         from qasp.crypto.signatures import verify
 
-        channel = PaymentChannel(
-            party_a=str(agent_a_did),
-            party_b=str(agent_b_did),
-            initial_balance_a=1000,
-            initial_balance_b=0,
+        agent_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
         )
-        channel.open(agent_a_secret_key, agent_b_secret_key)
-        channel.transfer(200, from_a_to_b=True, signing_key=agent_a_secret_key)
+        server_ch = PaymentChannel(
+            str(agent_a_did), str(agent_b_did),
+            agent_a_public_key, agent_b_public_key,
+        )
+        open_msg, _ = agent_ch.create_channel_open(1000)
+        response, _ = server_ch.process_channel_open(open_msg, 0)
+        agent_ch.accept_channel(response)
 
-        settlement = channel.close(agent_a_secret_key, agent_b_secret_key)
-        sig_a, sig_b = settlement.signatures
+        update, _ = agent_ch.create_state_update(
+            200, agent_a_secret_key,
+        )
+        signed, _ = server_ch.countersign_state_update(
+            update, agent_b_secret_key,
+        )
+        agent_ch.apply_state_update(signed)
 
-        # Both signatures should verify against the final state's signable bytes
-        final_state = channel.states[-1]
-        msg = final_state.signable_bytes()
-
-        assert verify(agent_a_public_key, msg, sig_a)
-        assert verify(agent_b_public_key, msg, sig_b)
+        # Both signatures should verify against signable bytes
+        msg = signed.signable_bytes()
+        assert verify(agent_a_public_key, msg, signed.agent_signature)
+        assert verify(agent_b_public_key, msg, signed.server_signature)

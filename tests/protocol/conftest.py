@@ -227,3 +227,51 @@ def registered_token_chain(
     crl.register_token(grandchild)
 
     return root, child, grandchild
+
+
+# =============================================================================
+# OCSP Responder Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def responder_keypair() -> tuple[bytes, bytes]:
+    """Generate a fresh ML-DSA-65 keypair for an OCSP responder."""
+    return signatures.generate_keypair()
+
+
+@pytest.fixture
+def responder_public_key(responder_keypair: tuple[bytes, bytes]) -> bytes:
+    """Extract responder's public key."""
+    return responder_keypair[0]
+
+
+@pytest.fixture
+def responder_secret_key(responder_keypair: tuple[bytes, bytes]) -> bytes:
+    """Extract responder's secret key."""
+    return responder_keypair[1]
+
+
+@pytest.fixture
+def responder_did(responder_public_key: bytes) -> DID:
+    """Create a DID for the OCSP responder."""
+    did, _ = create_did(responder_public_key)
+    return did
+
+
+@pytest.fixture
+def ocsp_responder(
+    responder_did: DID,
+    responder_secret_key: bytes,
+    responder_public_key: bytes,
+    crl: CertificateRevocationList,
+):
+    """Create an OCSP responder backed by the test CRL."""
+    from qasp.protocol.ocsp import OCSPResponder
+
+    return OCSPResponder(
+        responder_did=str(responder_did),
+        responder_secret_key=responder_secret_key,
+        responder_public_key=responder_public_key,
+        crl=crl,
+    )

@@ -170,7 +170,7 @@ class TestHandshakeConfig:
         """Default config should have expected values."""
         config = HandshakeConfig()
         assert config.protocol_version == DEFAULT_PROTOCOL_VERSION
-        assert config.supported_cipher_suites == (DEFAULT_CIPHER_SUITE,)
+        assert config.supported_cipher_suites == (2,)  # SUITE_HYBRID_TRANSITION
         assert config.enable_hybrid is True
 
     def test_custom_values(self) -> None:
@@ -230,7 +230,7 @@ class TestCreateClientHello:
     ) -> None:
         """ClientHello should have cipher suites."""
         client_hello = client_handshake.create_client_hello()
-        assert client_hello.cipher_suites == (DEFAULT_CIPHER_SUITE,)
+        assert client_hello.cipher_suites == (2,)  # SUITE_HYBRID_TRANSITION
 
     def test_transitions_to_sent_state(self, client_handshake: Handshake) -> None:
         """Should transition to SENT_CLIENT_HELLO state."""

@@ -1,0 +1,380 @@
+(* ===================================================================== *)
+(* QASP-Shake Handshake Protocol — CryptoVerif Computational Model       *)
+(*                                                                       *)
+(* Proves session key secrecy, mutual authentication, injective          *)
+(* agreement, and key agreement for the QASP-Shake 3-message handshake   *)
+(* with hybrid X25519 + ML-KEM-768 KEM.                                 *)
+(*                                                                       *)
+(* Message flow:                                                         *)
+(*   Client -> Server : ClientHello(Nc, kem_pk_C, sig_pk_C, suite)      *)
+(*   Server -> Client : ServerHello(Ns, ct_S, kem_pk_S, sig_pk_S,       *)
+(*                                  suite, sig_S)                        *)
+(*   Client -> Server : ClientAuth(ct_C, sig_C)                         *)
+(*                                                                       *)
+(* Dual KEM pattern: Server encapsulates to client's pk (ss1),           *)
+(*                   Client encapsulates to server's pk (ss2).           *)
+(*                   Session key = HKDF(ss1 || ss2, Nc || Ns, info)     *)
+(*                                                                       *)
+(* Crypto primitives (modeled in lib/):                                  *)
+(*   - HybridKEM: IND-CCA2 (X25519 + ML-KEM-768 combiner)             *)
+(*   - MLDSA65:   EUF-CMA (ML-DSA-65 signatures)                       *)
+(*   - HKDF_SHA384: PRF (HKDF-SHA-384 key derivation)                  *)
+(*   - CollisionResistantHash: CR (SHA-384 transcript hash)             *)
+(*                                                                       *)
+(* Reference:                                                            *)
+(*   formal/proverif/qasp_shake.pv — symbolic model                     *)
+(*   src/qasp/protocol/handshake.py — implementation                    *)
+(* ===================================================================== *)
+
+(* ---- Expand crypto library macros ---- *)
+
+expand HybridKEM(kemseed, kem_skey, kem_pkey, kem_ciphertext, kem_ss,
+                 kem_skgen, kem_pkgen, kem_enc, kem_dec, kem_ss_of,
+                 Pkem).
+
+expand MLDSA65(sigkeyseed, sig_skey, sig_pkey, signature,
+               sig_skgen, sig_pkgen, sig_sign, sig_verify,
+               Psig).
+
+expand HKDF_SHA384(hkdf_key, hkdf_output,
+                   hkdf,
+                   Phkdf).
+
+expand CollisionResistantHash(hash_output,
+                              cr_hash,
+                              Pcoll).
+
+
+(* ===================================================================== *)
+(* Protocol-specific types and constants                                 *)
+(* ===================================================================== *)
+
+type nonce_t [large,fixed].     (* 32-byte random nonce *)
+type suite_id [fixed].          (* Cipher suite identifier *)
+
+const SUITE_HYBRID: suite_id.   (* X25519 + ML-KEM-768 + ML-DSA-65 *)
+const QASP_INFO: bitstring.     (* "QASP-v1" info string for HKDF *)
+
+(* Session bound parameters *)
+param Nsessions.     (* Number of client/server sessions *)
+
+
+(* ===================================================================== *)
+(* Transcript construction functions                                     *)
+(*                                                                       *)
+(* These are [data] functions — injective constructors that the          *)
+(* adversary can compute. They model the deterministic concatenation     *)
+(* of handshake fields for signing.                                      *)
+(* ===================================================================== *)
+
+(* Server transcript: fields signed by the server *)
+fun build_server_transcript(
+  nonce_t,           (* client_nonce *)
+  kem_pkey,          (* client KEM pk *)
+  sig_pkey,          (* client sig pk *)
+  suite_id,          (* offered suite *)
+  nonce_t,           (* server_nonce *)
+  kem_ciphertext,    (* server KEM ciphertext *)
+  kem_pkey,          (* server KEM pk *)
+  sig_pkey,          (* server sig pk *)
+  suite_id           (* selected suite *)
+): bitstring [data].
+
+(* Client transcript: extends server transcript with server signature *)
+fun build_client_transcript(
+  nonce_t,           (* client_nonce *)
+  kem_pkey,          (* client KEM pk *)
+  sig_pkey,          (* client sig pk *)
+  suite_id,          (* offered suite *)
+  nonce_t,           (* server_nonce *)
+  kem_ciphertext,    (* server KEM ciphertext *)
+  kem_pkey,          (* server KEM pk *)
+  sig_pkey,          (* server sig pk *)
+  suite_id,          (* selected suite *)
+  signature          (* server signature *)
+): bitstring [data].
+
+(* Combine two KEM shared secrets into HKDF input key material *)
+fun combine_ss(kem_ss, kem_ss): hkdf_key [data].
+
+(* Concatenate nonces for HKDF salt *)
+fun concat_nonces(nonce_t, nonce_t): bitstring [data].
+
+
+(* ===================================================================== *)
+(* Events                                                                *)
+(* ===================================================================== *)
+
+event ClientStarted(sig_pkey, sig_pkey).
+event ServerStarted(sig_pkey, sig_pkey).
+event ClientFinished(sig_pkey, sig_pkey, hkdf_output).
+event ServerFinished(sig_pkey, sig_pkey, hkdf_output).
+
+
+(* ===================================================================== *)
+(* Security queries                                                      *)
+(* ===================================================================== *)
+
+(* Q1: Session key secrecy — client's derived key *)
+query secret session_key_C.
+
+(* Q2: Session key secrecy — server's derived key *)
+query secret session_key_S.
+
+(* Q3: Server authentication — if client finishes, server started *)
+query pkC: sig_pkey, pkS: sig_pkey, k: hkdf_output;
+  event(ClientFinished(pkC, pkS, k)) ==>
+  event(ServerStarted(pkS, pkC)).
+
+(* Q4: Client authentication — if server finishes, client started *)
+query pkC: sig_pkey, pkS: sig_pkey, k: hkdf_output;
+  event(ServerFinished(pkS, pkC, k)) ==>
+  event(ClientStarted(pkC, pkS)).
+
+(* Q5: Injective server authentication — replay protection *)
+query pkC: sig_pkey, pkS: sig_pkey, k: hkdf_output;
+  inj-event(ClientFinished(pkC, pkS, k)) ==>
+  inj-event(ServerStarted(pkS, pkC)).
+
+(* Q6: Injective client authentication — replay protection *)
+query pkC: sig_pkey, pkS: sig_pkey, k: hkdf_output;
+  inj-event(ServerFinished(pkS, pkC, k)) ==>
+  inj-event(ClientStarted(pkC, pkS)).
+
+(* Q7: Key agreement — both sides derive the same key *)
+query pkC: sig_pkey, pkS: sig_pkey, k1: hkdf_output, k2: hkdf_output;
+  event(ClientFinished(pkC, pkS, k1)) &&
+  event(ServerFinished(pkS, pkC, k2)) ==>
+  k1 = k2.
+
+
+(* ===================================================================== *)
+(* Tables for session tracking                                           *)
+(* ===================================================================== *)
+
+table client_sessions(sig_pkey, sig_pkey, hkdf_output).
+table server_sessions(sig_pkey, sig_pkey, hkdf_output).
+
+
+(* ===================================================================== *)
+(* Channel                                                               *)
+(* ===================================================================== *)
+
+channel c.
+
+
+(* ===================================================================== *)
+(* Client process                                                        *)
+(*                                                                       *)
+(* 1. Generate ephemeral KEM keypair                                     *)
+(* 2. Send ClientHello                                                   *)
+(* 3. Receive ServerHello, verify server signature                       *)
+(* 4. Decapsulate server's ct -> ss_S                                    *)
+(* 5. Encapsulate to server's pk -> ct_C, ss_C                          *)
+(* 6. Sign full transcript -> client_sig                                 *)
+(* 7. Send ClientAuth                                                    *)
+(* 8. Derive session_key = HKDF(ss_S || ss_C, Nc || Ns, info)          *)
+(* ===================================================================== *)
+
+let Client(sig_seed_C: sigkeyseed, sig_pk_S: sig_pkey) =
+  (* Generate ephemeral KEM keypair *)
+  new kem_seed_C: kemseed;
+  let kem_sk_C: kem_skey = kem_skgen(kem_seed_C) in
+  let kem_pk_C: kem_pkey = kem_pkgen(kem_seed_C) in
+
+  (* Long-term signing key *)
+  let sig_sk_C: sig_skey = sig_skgen(sig_seed_C) in
+  let sig_pk_C: sig_pkey = sig_pkgen(sig_seed_C) in
+
+  (* Generate client nonce *)
+  new client_nonce: nonce_t;
+
+  event ClientStarted(sig_pk_C, sig_pk_S);
+
+  (* --- Send ClientHello --- *)
+  out(c, (client_nonce, kem_pk_C, sig_pk_C, SUITE_HYBRID));
+
+  (* --- Receive ServerHello --- *)
+  in(c, (
+    server_nonce: nonce_t,
+    kem_ct_S: kem_ciphertext,
+    kem_pk_S: kem_pkey,
+    srv_sig_pk: sig_pkey,
+    selected_suite: suite_id,
+    server_sig: signature
+  ));
+
+  (* Verify server identity *)
+  if srv_sig_pk = sig_pk_S then
+
+  (* Build and verify server transcript *)
+  let t_server: bitstring = build_server_transcript(
+    client_nonce, kem_pk_C, sig_pk_C, SUITE_HYBRID,
+    server_nonce, kem_ct_S, kem_pk_S, srv_sig_pk, selected_suite
+  ) in
+  if sig_verify(srv_sig_pk, t_server, server_sig) = true then
+
+  (* Decapsulate server's KEM ciphertext -> shared_secret_1 *)
+  let ss_S: kem_ss = kem_dec(kem_sk_C, kem_ct_S) in
+
+  (* Encapsulate to server's KEM public key -> shared_secret_2 *)
+  new kem_enc_seed_C: kem_enc_seed;
+  let kem_ct_C: kem_ciphertext = kem_enc(kem_enc_seed_C, kem_pk_S) in
+  let ss_C: kem_ss = kem_ss_of(kem_enc_seed_C) in
+
+  (* Sign full transcript (includes server signature) *)
+  let t_client: bitstring = build_client_transcript(
+    client_nonce, kem_pk_C, sig_pk_C, SUITE_HYBRID,
+    server_nonce, kem_ct_S, kem_pk_S, srv_sig_pk, selected_suite,
+    server_sig
+  ) in
+  let client_sig: signature = sig_sign(sig_sk_C, t_client) in
+
+  (* --- Send ClientAuth --- *)
+  out(c, (kem_ct_C, client_sig));
+
+  (* Derive session key *)
+  let combined: hkdf_key = combine_ss(ss_S, ss_C) in
+  let salt: bitstring = concat_nonces(client_nonce, server_nonce) in
+  let session_key_C: hkdf_output = hkdf(combined, salt, QASP_INFO) in
+
+  event ClientFinished(sig_pk_C, sig_pk_S, session_key_C);
+  insert client_sessions(sig_pk_C, sig_pk_S, session_key_C);
+  0.
+
+
+(* ===================================================================== *)
+(* Server process                                                        *)
+(*                                                                       *)
+(* 1. Receive ClientHello                                                *)
+(* 2. Generate ephemeral KEM keypair and server nonce                    *)
+(* 3. Encapsulate to client's pk -> ct_S, ss_S                          *)
+(* 4. Sign server transcript -> server_sig                               *)
+(* 5. Send ServerHello                                                   *)
+(* 6. Receive ClientAuth, verify client signature                        *)
+(* 7. Decapsulate client's ct -> ss_C                                    *)
+(* 8. Derive session_key = HKDF(ss_S || ss_C, Nc || Ns, info)          *)
+(* ===================================================================== *)
+
+let Server(sig_seed_S: sigkeyseed, sig_pk_C: sig_pkey) =
+  (* --- Receive ClientHello --- *)
+  in(c, (
+    client_nonce: nonce_t,
+    kem_pk_C: kem_pkey,
+    cli_sig_pk: sig_pkey,
+    offered_suite: suite_id
+  ));
+
+  (* Generate ephemeral KEM keypair *)
+  new kem_seed_S: kemseed;
+  let kem_sk_S: kem_skey = kem_skgen(kem_seed_S) in
+  let kem_pk_S: kem_pkey = kem_pkgen(kem_seed_S) in
+
+  (* Long-term signing key *)
+  let sig_sk_S: sig_skey = sig_skgen(sig_seed_S) in
+  let sig_pk_S: sig_pkey = sig_pkgen(sig_seed_S) in
+
+  (* Select cipher suite *)
+  let selected_suite: suite_id = offered_suite in
+
+  event ServerStarted(sig_pk_S, cli_sig_pk);
+
+  (* Generate server nonce *)
+  new server_nonce: nonce_t;
+
+  (* Encapsulate to client's KEM public key -> shared_secret_1 *)
+  new kem_enc_seed_S: kem_enc_seed;
+  let kem_ct_S: kem_ciphertext = kem_enc(kem_enc_seed_S, kem_pk_C) in
+  let ss_S: kem_ss = kem_ss_of(kem_enc_seed_S) in
+
+  (* Build and sign server transcript *)
+  let t_server: bitstring = build_server_transcript(
+    client_nonce, kem_pk_C, cli_sig_pk, offered_suite,
+    server_nonce, kem_ct_S, kem_pk_S, sig_pk_S, selected_suite
+  ) in
+  let server_sig: signature = sig_sign(sig_sk_S, t_server) in
+
+  (* --- Send ServerHello --- *)
+  out(c, (
+    server_nonce, kem_ct_S, kem_pk_S, sig_pk_S,
+    selected_suite, server_sig
+  ));
+
+  (* --- Receive ClientAuth --- *)
+  in(c, (
+    kem_ct_C: kem_ciphertext,
+    client_sig: signature
+  ));
+
+  (* Verify client identity *)
+  if cli_sig_pk = sig_pk_C then
+
+  (* Build and verify client transcript *)
+  let t_client: bitstring = build_client_transcript(
+    client_nonce, kem_pk_C, cli_sig_pk, offered_suite,
+    server_nonce, kem_ct_S, kem_pk_S, sig_pk_S, selected_suite,
+    server_sig
+  ) in
+  if sig_verify(cli_sig_pk, t_client, client_sig) = true then
+
+  (* Decapsulate client's KEM ciphertext -> shared_secret_2 *)
+  let ss_C: kem_ss = kem_dec(kem_sk_S, kem_ct_C) in
+
+  (* Derive session key *)
+  let combined: hkdf_key = combine_ss(ss_S, ss_C) in
+  let salt: bitstring = concat_nonces(client_nonce, server_nonce) in
+  let session_key_S: hkdf_output = hkdf(combined, salt, QASP_INFO) in
+
+  event ServerFinished(sig_pk_S, sig_pk_C, session_key_S);
+  insert server_sessions(sig_pk_S, sig_pk_C, session_key_S);
+  0.
+
+
+(* ===================================================================== *)
+(* Main process                                                          *)
+(*                                                                       *)
+(* Generate long-term signing keys, publish public keys,                 *)
+(* run unbounded client and server sessions.                             *)
+(* ===================================================================== *)
+
+process
+  (* Generate long-term signing key seeds *)
+  new sig_seed_C: sigkeyseed;
+  new sig_seed_S: sigkeyseed;
+
+  let sig_pk_C: sig_pkey = sig_pkgen(sig_seed_C) in
+  let sig_pk_S: sig_pkey = sig_pkgen(sig_seed_S) in
+
+  (* Publish signing public keys (identity is public) *)
+  out(c, sig_pk_C);
+  out(c, sig_pk_S);
+
+  (* Run unbounded sessions *)
+  (
+    (! i_C <= Nsessions Client(sig_seed_C, sig_pk_S))
+  |
+    (! i_S <= Nsessions Server(sig_seed_S, sig_pk_C))
+  )
+
+
+(* ===================================================================== *)
+(* Proof guidance                                                        *)
+(*                                                                       *)
+(* Sequence of game transformations:                                     *)
+(* 1. Apply IND-CCA2 to client's ephemeral KEM seed                     *)
+(* 2. Apply IND-CCA2 to server's ephemeral KEM seed                     *)
+(* 3. Apply EUF-CMA to server's signing key (server authentication)     *)
+(* 4. Apply EUF-CMA to client's signing key (client authentication)     *)
+(* 5. Apply PRF to HKDF (session key indistinguishable from random)     *)
+(* 6. Simplify and conclude                                              *)
+(* ===================================================================== *)
+
+proof {
+  crypto ind_cca2(HybridKEM) kem_seed_C;
+  crypto ind_cca2(HybridKEM) kem_seed_S;
+  crypto euf_cma(MLDSA65) sig_seed_S;
+  crypto euf_cma(MLDSA65) sig_seed_C;
+  crypto prf(HKDF_SHA384);
+  simplify;
+  success.
+}

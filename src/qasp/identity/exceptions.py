@@ -10,11 +10,20 @@ __all__ = [
     "BindingError",
     "BindingExpiredError",
     "BindingPermissionError",
+    "DHTEntryError",
     "DIDError",
     "DIDResolutionError",
+    "ExpiredSVIDError",
     "IdentityError",
     "InvalidBindingError",
     "InvalidDIDError",
+    "InvalidSPIFFEIDError",
+    "KeyRotationError",
+    "SPIFFEError",
+    "SVIDVerificationError",
+    "StaleEntryError",
+    "ThresholdGroupError",
+    "TrustBundleError",
 ]
 
 
@@ -78,3 +87,43 @@ class BindingPermissionError(BindingError):
     This indicates the binding does not grant the required permission
     for the requested operation.
     """
+
+
+class DHTEntryError(DIDError):
+    """Raised when a DHT entry is invalid (signature failure, bad structure)."""
+
+
+class StaleEntryError(DHTEntryError):
+    """Raised when a DHT entry version <= currently stored version (replay prevention)."""
+
+
+class KeyRotationError(DIDError):
+    """Raised when DID key rotation fails.
+
+    This includes pre-commitment mismatches, invalid rotation proofs,
+    or version increment violations.
+    """
+
+
+class SPIFFEError(IdentityError):
+    """Base exception for SPIFFE-related errors."""
+
+
+class InvalidSPIFFEIDError(SPIFFEError):
+    """Raised when a SPIFFE ID is malformed or invalid."""
+
+
+class SVIDVerificationError(SPIFFEError):
+    """Raised when SVID certificate verification fails."""
+
+
+class ExpiredSVIDError(SVIDVerificationError):
+    """Raised when an SVID certificate has expired."""
+
+
+class ThresholdGroupError(IdentityError):
+    """Raised when threshold group creation or validation fails."""
+
+
+class TrustBundleError(SPIFFEError):
+    """Raised when a trust bundle operation fails."""

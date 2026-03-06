@@ -258,6 +258,8 @@ class DIDDocument:
     authentication: tuple[str, ...] = field(default_factory=tuple)
     assertion_method: tuple[str, ...] = field(default_factory=tuple)
     service_endpoints: dict[str, str] = field(default_factory=dict)
+    next_key_hash: bytes | None = None
+    key_version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-LD dictionary.
@@ -284,6 +286,10 @@ class DIDDocument:
                 {"id": f"{self.did}#service-{i}", "type": stype, "serviceEndpoint": endpoint}
                 for i, (stype, endpoint) in enumerate(self.service_endpoints.items())
             ]
+
+        if self.next_key_hash is not None:
+            doc["nextKeyHash"] = self.next_key_hash.hex()
+        doc["keyVersion"] = self.key_version
 
         return doc
 

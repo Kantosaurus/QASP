@@ -14,6 +14,7 @@ __all__ = [
     "HandshakeKEMError",
     "HandshakeSuiteError",
     "HandshakeTimeoutError",
+    "HandshakeUpgradeRequiredError",
     "HandshakeVersionError",
 ]
 
@@ -115,6 +116,30 @@ class HandshakeKEMError(HandshakeError):
     def __init__(self, message: str, operation: str = "") -> None:
         super().__init__(message)
         self.operation = operation
+
+
+class HandshakeUpgradeRequiredError(HandshakeError):
+    """Raised when the server requires a post-quantum capable cipher suite.
+
+    This occurs when the server supports PQ suites but the client only
+    offers classical suites, triggering downgrade resistance.
+
+    Attributes:
+        client_suites: Cipher suites offered by the client.
+        server_suites: Cipher suites supported by the server.
+    """
+
+    alert_code: int = 72  # upgrade_required
+
+    def __init__(
+        self,
+        message: str,
+        client_suites: tuple[int, ...] | None = None,
+        server_suites: tuple[int, ...] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.client_suites = client_suites
+        self.server_suites = server_suites
 
 
 class HandshakeTimeoutError(HandshakeError):

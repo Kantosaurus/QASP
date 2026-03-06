@@ -136,6 +136,8 @@ markers = [
     "integration: marks tests as integration tests",
     "property: marks tests as property-based tests (Hypothesis)",
     "fuzz: marks tests that require Atheris (Linux only)",
+    "demo: marks demo scenario tests",
+    "security: marks security-focused tests",
 ]
 
 [tool.bandit]

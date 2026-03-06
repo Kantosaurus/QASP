@@ -8,6 +8,9 @@ from __future__ import annotations
 
 __all__ = [
     "CryptoError",
+    "DKGCommitmentMismatchError",
+    "DKGProtocolError",
+    "DKGShareVerificationError",
     "DecapsulationError",
     "DecryptionError",
     "EncapsulationError",
@@ -17,6 +20,11 @@ __all__ = [
     "KeyDerivationError",
     "KeyGenerationError",
     "SignatureError",
+    "ThresholdConfigError",
+    "ThresholdError",
+    "ThresholdSigningAbortError",
+    "ThresholdSigningError",
+    "UnknownCipherSuiteError",
     "VerificationError",
 ]
 
@@ -104,3 +112,35 @@ class DecryptionError(CryptoError):
     This includes authentication tag verification failures, indicating
     the ciphertext was tampered with or the wrong key was used.
     """
+
+
+class UnknownCipherSuiteError(CryptoError):
+    """Raised when looking up an unregistered cipher suite ID."""
+
+
+class ThresholdError(CryptoError):
+    """Base exception for threshold cryptography errors."""
+
+
+class ThresholdConfigError(ThresholdError):
+    """Raised when threshold configuration is invalid (e.g., M > N)."""
+
+
+class DKGProtocolError(ThresholdError):
+    """Raised when DKG protocol encounters wrong state or missing messages."""
+
+
+class DKGCommitmentMismatchError(DKGProtocolError):
+    """Raised when a DKG commitment hash doesn't match."""
+
+
+class DKGShareVerificationError(DKGProtocolError):
+    """Raised when a DKG share is inconsistent with its commitment."""
+
+
+class ThresholdSigningError(ThresholdError):
+    """Raised when threshold signing fails."""
+
+
+class ThresholdSigningAbortError(ThresholdSigningError):
+    """Raised when threshold signing must abort (e.g., signer dropout)."""

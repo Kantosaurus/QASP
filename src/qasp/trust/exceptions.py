@@ -7,13 +7,17 @@ failure modes, enabling precise error handling.
 from __future__ import annotations
 
 __all__ = [
+    "BehavioralError",
     "CertificationError",
     "DuplicateEntryError",
     "EntryNotFoundError",
     "InvalidProofError",
     "InvalidSLSALevelError",
+    "InvalidTransitionError",
     "InvalidVCError",
+    "ManifestError",
     "RegistryError",
+    "ReputationError",
     "TrustError",
     "VCExpiredError",
     "VCNotYetValidError",
@@ -92,3 +96,19 @@ class DuplicateEntryError(RegistryError):
 
     This indicates a trust entry already exists for the given DID.
     """
+
+
+class ReputationError(TrustError):
+    """Raised on reputation model failures."""
+
+
+class BehavioralError(TrustError):
+    """Raised on behavioral verification failures."""
+
+
+class ManifestError(BehavioralError):
+    """Raised on manifest signing or verification failures."""
+
+
+class InvalidTransitionError(BehavioralError):
+    """Raised on unpermitted FSM transitions."""

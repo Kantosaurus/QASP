@@ -7,17 +7,20 @@ failure modes, enabling precise error handling for network operations.
 from __future__ import annotations
 
 __all__ = [
-    "TransportError",
+    "AdvertisementError",
+    "ConnectionClosedError",
     "ConnectionError",
     "ConnectionRefusedError",
     "ConnectionTimeoutError",
-    "ConnectionClosedError",
-    "SendError",
-    "ReceiveError",
-    "FramingError",
     "DiscoveryError",
-    "AdvertisementError",
     "DiscoveryTimeoutError",
+    "FramingError",
+    "ReceiveError",
+    "RegistryEntryError",
+    "RegistryQueryError",
+    "RegistrySignatureError",
+    "SendError",
+    "TransportError",
 ]
 
 
@@ -95,3 +98,15 @@ class AdvertisementError(DiscoveryError):
 
 class DiscoveryTimeoutError(DiscoveryError):
     """Raised when a discovery operation times out."""
+
+
+class RegistryEntryError(DiscoveryError):
+    """Raised for invalid, expired, or unverifiable registry entries."""
+
+
+class RegistryQueryError(DiscoveryError):
+    """Raised for malformed registry queries."""
+
+
+class RegistrySignatureError(RegistryEntryError):
+    """Raised when ML-DSA-65 signature verification fails for a registry entry."""

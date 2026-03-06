@@ -67,6 +67,7 @@ class RevocationReason(IntEnum):
     DELEGATION_REVOKED = 4
     OWNER_REQUEST = 5
     CONSTRAINT_VIOLATION = 6
+    CROSS_DOMAIN_REVOKED = 7
 
 
 # =============================================================================

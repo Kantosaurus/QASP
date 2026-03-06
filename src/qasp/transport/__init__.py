@@ -3,6 +3,7 @@
 This module provides transport implementations:
 - TCP transport with length-prefixed framing
 - QASP-Discover for service discovery
+- Registry-based agent discovery
 """
 
 from .discover import (
@@ -27,8 +28,24 @@ from .exceptions import (
     DiscoveryTimeoutError,
     FramingError,
     ReceiveError,
+    RegistryEntryError,
+    RegistryQueryError,
+    RegistrySignatureError,
     SendError,
     TransportError,
+)
+from .registry import (
+    DEFAULT_REGISTRY_TTL,
+    MAX_QUERY_RESULTS,
+    AgentRegistry,
+    CapEntry,
+    RegistryEntry,
+    RegistryQuery,
+    RegistryResponse,
+    create_registry_entry,
+    get_agent_registry,
+    match_capability,
+    verify_registry_entry,
 )
 from .tcp import (
     DEFAULT_READ_SIZE,
@@ -45,11 +62,15 @@ __all__ = [
     "DEFAULT_AD_TTL",
     "DEFAULT_DISCOVERY_TIMEOUT",
     "DEFAULT_READ_SIZE",
+    "DEFAULT_REGISTRY_TTL",
     "LENGTH_PREFIX_SIZE",
     "MAX_MESSAGE_SIZE",
+    "MAX_QUERY_RESULTS",
     "MDNS_SERVICE_TYPE",
     "WELL_KNOWN_PATH",
     "AdvertisementError",
+    "AgentRegistry",
+    "CapEntry",
     "CapabilityAdvertisement",
     "ConnectionClosedError",
     "ConnectionError",
@@ -61,6 +82,12 @@ __all__ = [
     "DiscoveryTimeoutError",
     "FramingError",
     "ReceiveError",
+    "RegistryEntry",
+    "RegistryEntryError",
+    "RegistryQuery",
+    "RegistryQueryError",
+    "RegistryResponse",
+    "RegistrySignatureError",
     "SendError",
     "ServiceEndpoint",
     "TCPServer",
@@ -68,9 +95,13 @@ __all__ = [
     "TransportError",
     "connect",
     "create_advertisement",
+    "create_registry_entry",
     "discover",
+    "get_agent_registry",
     "listen",
+    "match_capability",
     "serve",
     "tcp",
     "verify_advertisement",
+    "verify_registry_entry",
 ]

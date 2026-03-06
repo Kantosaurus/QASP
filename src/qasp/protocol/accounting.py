@@ -45,6 +45,7 @@ class Receipt:
 
     records: list[UsageRecord]
     total_units: int
+    total_cost: int
     issued_at: datetime
     issuer: str
     signature: bytes
@@ -69,6 +70,7 @@ class Receipt:
                 for r in self.records
             ],
             "total_units": self.total_units,
+            "total_cost": self.total_cost,
             "issued_at": self.issued_at.isoformat(),
             "issuer": self.issuer,
             "signature": self.signature,
@@ -94,6 +96,7 @@ class Receipt:
         return cls(
             records=records,
             total_units=d["total_units"],
+            total_cost=d.get("total_cost", 0),
             issued_at=datetime.fromisoformat(d["issued_at"]),
             issuer=d["issuer"],
             signature=bytes(d["signature"]),
@@ -174,6 +177,7 @@ class Meter:
         receipt = Receipt(
             records=list(self._records),
             total_units=self.total_units,
+            total_cost=0,
             issued_at=datetime.now(UTC),
             issuer=self._issuer,
             signature=b"",  # placeholder
@@ -185,6 +189,7 @@ class Meter:
         receipt = Receipt(
             records=receipt.records,
             total_units=receipt.total_units,
+            total_cost=receipt.total_cost,
             issued_at=receipt.issued_at,
             issuer=receipt.issuer,
             signature=sig,

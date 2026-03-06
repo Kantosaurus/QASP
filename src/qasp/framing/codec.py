@@ -307,6 +307,14 @@ def _dict_to_message(message_type: MessageType, data: dict[str, Any]) -> Message
         MessageType.CHANNEL_CLOSE: messages.ChannelClose,
         MessageType.PRICE_REQUEST: messages.PriceRequest,
         MessageType.ALERT: messages.Alert,
+        MessageType.PRICE_OFFER: messages.PriceOffer,
+        MessageType.PRICE_ACCEPT: messages.PriceAccept,
+        MessageType.DELEGATION_REQUEST: messages.DelegationRequest,
+        MessageType.DELEGATION_GRANT: messages.DelegationGrant,
+        MessageType.RECONCILIATION_REQUEST: messages.ReconciliationRequest,
+        MessageType.RECONCILIATION_RESPONSE: messages.ReconciliationResponse,
+        MessageType.OCSP_REQUEST: messages.OCSPRequestMessage,
+        MessageType.OCSP_RESPONSE: messages.OCSPResponseMessage,
     }
 
     msg_class = type_to_class.get(message_type)

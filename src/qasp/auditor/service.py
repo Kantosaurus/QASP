@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from qasp.auditor.fault import FaultAttributor, FaultRecord
 from qasp.crypto.signatures import sign
 from qasp.framing.messages import DisputeVerdict
+from qasp.protocol.privacy import TraceDecryptionError, TraceEntry, decrypt_auditor_envelope
 from qasp.protocol.accounting import ReceiptChain, ReceiptChainError
 from qasp.protocol.dispute import (
     DisputeNotFoundError,
@@ -42,11 +44,17 @@ class AuditorService:
         auditor_did: str,
         secret_key: bytes,
         public_key: bytes,
+        kem_secret_key: bytes | None = None,
+        kem_public_key: bytes | None = None,
     ) -> None:
         self._auditor_did = auditor_did
         self._secret_key = secret_key
         self._public_key = public_key
+        self._kem_secret_key = kem_secret_key
+        self._kem_public_key = kem_public_key
         self._disputes: dict[bytes, DisputeRecord] = {}
+        self._fault_attributor = FaultAttributor()
+        self._fault_records: dict[bytes, FaultRecord] = {}
 
     @property
     def auditor_did(self) -> str:
@@ -55,6 +63,32 @@ class AuditorService:
     @property
     def public_key(self) -> bytes:
         return self._public_key
+
+    @property
+    def kem_public_key(self) -> bytes | None:
+        return self._kem_public_key
+
+    def decrypt_trace_arguments(self, trace_entry: TraceEntry) -> bytes:
+        """Decrypt the encrypted arguments from a trace entry.
+
+        Args:
+            trace_entry: The trace entry containing the auditor envelope.
+
+        Returns:
+            The decrypted argument bytes.
+
+        Raises:
+            TraceDecryptionError: If KEM keys are not configured or decryption fails.
+        """
+        if self._kem_secret_key is None:
+            raise TraceDecryptionError(
+                "Auditor KEM secret key not configured"
+            )
+        return decrypt_auditor_envelope(
+            trace_entry.args_encrypted,
+            self._kem_secret_key,
+            trace_entry.token_id,
+        )
 
     def open_dispute(
         self,
@@ -139,11 +173,16 @@ class AuditorService:
         respondent_chain: ReceiptChain | None = None,
         claimant_public_key: bytes | None = None,
         respondent_public_key: bytes | None = None,
+        trace_entries: list[TraceEntry] | None = None,
+        price_schedule: object | None = None,
+        token_constraints: object | None = None,
+        signer_public_key: bytes | None = None,
     ) -> DisputeVerdict:
         """Review a dispute and issue a verdict.
 
-        Verifies receipt chains, compares evidence, and computes
-        a binding payment adjustment.
+        Verifies receipt chains, compares evidence, optionally replays
+        traces, performs fault attribution, and computes a binding
+        payment adjustment.
 
         Args:
             dispute_id: The dispute to review.
@@ -151,6 +190,10 @@ class AuditorService:
             respondent_chain: Respondent's receipt chain.
             claimant_public_key: Claimant's public key for chain verification.
             respondent_public_key: Respondent's public key for chain verification.
+            trace_entries: Optional trace entries for replay verification.
+            price_schedule: Optional PriceSchedule for trace cost computation.
+            token_constraints: Optional Constraints for trace validation.
+            signer_public_key: Optional public key for trace signature verification.
 
         Returns:
             A signed DisputeVerdict message.
@@ -172,6 +215,13 @@ class AuditorService:
                 respondent_chain, respondent_public_key
             )
 
+        # Replay traces if provided
+        if trace_entries and signer_public_key:
+            self._replay_traces(
+                trace_entries, price_schedule,
+                token_constraints, signer_public_key,
+            )
+
         # Compare chains and determine verdict
         verdict_code, awarded_value = self._evaluate_dispute(
             record,
@@ -181,7 +231,59 @@ class AuditorService:
             respondent_valid,
         )
 
+        # Fault attribution
+        discrepancies: list[tuple[int, int, int]] = []
+        total_units = 0
+        if claimant_chain and respondent_chain:
+            discrepancies = self._compare_receipt_chains(
+                claimant_chain, respondent_chain,
+            )
+            total_units = sum(
+                r.total_units for r in respondent_chain.receipts
+            ) if respondent_chain.receipts else 0
+
+        fault_record = self._fault_attributor.attribute(
+            discrepancies=discrepancies,
+            claimant_chain_valid=claimant_valid,
+            respondent_chain_valid=respondent_valid,
+            claimant_did=record.claimant_did,
+            respondent_did=record.respondent_did,
+            dispute_id=dispute_id,
+            total_units=total_units,
+        )
+        if fault_record is not None:
+            self._fault_records[dispute_id] = fault_record
+            record.fault_attribution = fault_record.faulty_party_did
+
         return self._issue_verdict(dispute_id, verdict_code, awarded_value)
+
+    def get_fault_record(self, dispute_id: bytes) -> FaultRecord | None:
+        """Retrieve the fault record for a dispute, if any."""
+        return self._fault_records.get(dispute_id)
+
+    def _replay_traces(
+        self,
+        trace_entries: list[TraceEntry],
+        price_schedule: object | None,
+        token_constraints: object | None,
+        signer_public_key: bytes,
+    ) -> tuple[int, bool]:
+        """Replay trace entries and compute total units.
+
+        Returns:
+            (computed_units, all_valid)
+        """
+        from qasp.protocol.privacy import verify_trace_entry
+
+        computed_units = 0
+        all_valid = True
+        for entry in trace_entries:
+            try:
+                verify_trace_entry(entry, signer_public_key)
+                computed_units += entry.units
+            except Exception:
+                all_valid = False
+        return computed_units, all_valid
 
     def _verify_receipt_chain(
         self,

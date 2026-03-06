@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from qasp.transport.registry import AgentRegistry, CapEntry, create_registry_entry
+
 if TYPE_CHECKING:
+    from qasp.identity.did import DIDDocument, DIDRegistry
     from qasp.transport.discover import CapabilityAdvertisement
     from qasp.transport.tcp import TCPServer, TCPTransport
 
@@ -176,4 +179,71 @@ def sample_advertisement(mock_did: str) -> CapabilityAdvertisement:
         ttl=300,
         created_at=time.time(),
         signature=b"",
+    )
+
+
+@pytest.fixture
+def did_registry_with_doc(
+    discovery_keypair: tuple[bytes, bytes],
+) -> tuple[DIDRegistry, DIDDocument, str]:
+    """Create a DID registry with a registered document. Returns (registry, doc, did_str)."""
+    from qasp.identity.did import DIDRegistry, create_did
+
+    pub, _sec = discovery_keypair
+    did, doc = create_did(pub)
+    registry = DIDRegistry()
+    registry.register(doc)
+    return registry, doc, str(did)
+
+
+@pytest.fixture
+def agent_registry(
+    did_registry_with_doc: tuple[DIDRegistry, DIDDocument, str],
+) -> AgentRegistry:
+    """Fresh AgentRegistry with injected DID registry."""
+    registry, _doc, _did = did_registry_with_doc
+    return AgentRegistry(did_registry=registry)
+
+
+@pytest.fixture
+def sample_cap_entries() -> tuple[CapEntry, ...]:
+    """Tuple of sample CapEntry objects with varied URIs/verbs."""
+    return (
+        CapEntry(
+            resource_uri="qasp://myhost/gpu/infer",
+            verbs=frozenset({"invoke", "read"}),
+            description="GPU inference endpoint",
+        ),
+        CapEntry(
+            resource_uri="qasp://myhost/storage/upload",
+            verbs=frozenset({"write", "delete"}),
+            description="Storage upload endpoint",
+        ),
+        CapEntry(
+            resource_uri="qasp://myhost/api/v1/status",
+            verbs=frozenset({"read"}),
+            description="Status API",
+        ),
+    )
+
+
+@pytest.fixture
+def sample_registry_entry(
+    discovery_keypair: tuple[bytes, bytes],
+    did_registry_with_doc: tuple[DIDRegistry, DIDDocument, str],
+    sample_cap_entries: tuple[CapEntry, ...],
+) -> RegistryEntry:
+    """Signed RegistryEntry for testing."""
+    from qasp.transport.registry import RegistryEntry, create_registry_entry
+
+    _pub, sec = discovery_keypair
+    _registry, doc, did_str = did_registry_with_doc
+    return create_registry_entry(
+        agent_did=did_str,
+        secret_key=sec,
+        did_document=doc,
+        capabilities=sample_cap_entries,
+        trust_score=0.85,
+        audit_vcs=(),
+        endpoint=("127.0.0.1", 9000),
     )

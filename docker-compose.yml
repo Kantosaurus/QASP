@@ -1,0 +1,31 @@
+services:
+  qasp-node-a:
+    build:
+      context: .
+      target: test
+    networks:
+      - qasp-net
+    command: ["sleep", "infinity"]
+
+  qasp-node-b:
+    build:
+      context: .
+      target: test
+    networks:
+      - qasp-net
+    command: ["sleep", "infinity"]
+
+  conformance-runner:
+    build:
+      context: .
+      target: test
+    networks:
+      - qasp-net
+    command: ["tests/conformance/", "-v", "--tb=short"]
+    depends_on:
+      - qasp-node-a
+      - qasp-node-b
+
+networks:
+  qasp-net:
+    driver: bridge

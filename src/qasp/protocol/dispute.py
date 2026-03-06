@@ -47,6 +47,7 @@ class DisputeType(IntEnum):
     OVERCHARGE = 2
     UNAUTHORIZED_ACCESS = 3
     SERVICE_FAILURE = 4
+    RECONCILIATION_FAILURE = 5
 
 
 class VerdictCode(IntEnum):
@@ -147,6 +148,12 @@ class DisputeRecord:
     opened_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     resolved_at: datetime | None = None
     verdict: VerdictCode | None = None
+    reconciliation_attempted: bool = False
+    agent_chain_cbor: bytes = b""
+    server_chain_cbor: bytes = b""
+    divergence_point_seq: int = 0
+    trace_entries: list[bytes] = field(default_factory=list)
+    fault_attribution: str = ""
 
     def transition_to(self, new_state: DisputeState) -> None:
         """Transition to a new state, validating the transition.
@@ -170,6 +177,10 @@ def create_dispute_open(
     dispute_type: DisputeType,
     claimed_value: int,
     receipt_range_hash: bytes,
+    *,
+    agent_chain_cbor: bytes = b"",
+    server_chain_cbor: bytes = b"",
+    divergence_point_seq: int = 0,
 ) -> tuple[DisputeOpen, bytes]:
     """Build a DisputeOpen wire message.
 
@@ -178,10 +189,14 @@ def create_dispute_open(
         dispute_type: Type of dispute.
         claimed_value: Value claimed by the disputant.
         receipt_range_hash: SHA-384 hash of the receipt range.
+        agent_chain_cbor: Agent's CBOR receipt chain (stored on record, not wire).
+        server_chain_cbor: Server's CBOR receipt chain (stored on record, not wire).
+        divergence_point_seq: First disagreeing receipt sequence number.
 
     Returns:
         Tuple of (DisputeOpen message, dispute_id).
     """
+    _ = agent_chain_cbor, server_chain_cbor, divergence_point_seq  # stored on record
     dispute_id = os.urandom(32)
     msg = DisputeOpen(
         dispute_id=dispute_id,

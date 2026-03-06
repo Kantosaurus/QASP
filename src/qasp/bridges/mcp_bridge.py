@@ -302,6 +302,11 @@ class QASPToolProvider:
             handler=handler,
         )
 
+    @staticmethod
+    def inject_token_meta(token: CapabilityToken) -> dict[str, str]:
+        """Serialize a QASP token for MCP ``_meta`` transport."""
+        return inject_qasp_token(token)
+
     def get_tools(self) -> list[Tool]:
         """Return MCP Tool definitions for all registered capabilities."""
         tools: list[Tool] = []
@@ -413,14 +418,25 @@ class MCPBridge:
         server_name: str = "mcp-server",
         did_registry: DIDRegistry | None = None,
         revocation_checker: RevocationChecker | None = None,
+        backend: Any = None,
+        issuer_public_key: bytes | None = None,
     ) -> None:
-        if server_command is None and session is None:
-            raise MCPBridgeError(
-                "Either server_command or session must be provided"
-            )
+        if backend is not None:
+            # Local backend mode — no MCP server needed
+            self._backend = backend
+            self._issuer_public_key = issuer_public_key
+            self._server_command = None
+            self._external_session = None
+        else:
+            if server_command is None and session is None:
+                raise MCPBridgeError(
+                    "Either server_command or session must be provided"
+                )
+            self._backend = None
+            self._issuer_public_key = None
+            self._server_command = server_command
+            self._external_session = session
 
-        self._server_command = server_command
-        self._external_session = session
         self._server_name = server_name
         self._did_registry = did_registry or DIDRegistry()
         self._revocation_checker = revocation_checker
@@ -564,21 +580,81 @@ class MCPBridge:
             constraints=constraints,
         )
 
-    async def call_tool(
+    def call_tool(
         self,
         name: str,
         arguments: dict[str, Any],
-        qasp_token: CapabilityToken,
+        qasp_token: CapabilityToken | None = None,
+        *,
+        meta: dict[str, Any] | None = None,
     ) -> Any:
         """Call an MCP tool with QASP token verification.
 
+        In local-backend mode this runs synchronously and returns
+        the backend result directly.  In remote mode it returns a
+        coroutine (use ``await``).
+
         Raises:
+            CapabilityError: (local mode) On any auth failure.
             MCPToolNotFoundError: If the tool is not known.
-            MCPAuthorizationError: If authorization fails.
+            MCPAuthorizationError: (remote mode) If authorization fails.
             MCPConnectionError: If the bridge is not connected.
         """
+        if self._backend is not None:
+            return self._call_tool_local(name, arguments, qasp_token, meta)
+        return self._call_tool_remote(name, arguments, qasp_token)
+
+    def _call_tool_local(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        qasp_token: CapabilityToken | None,
+        meta: dict[str, Any] | None,
+    ) -> Any:
+        """Synchronous local-backend path."""
+        from qasp.protocol.capability import CapabilityError
+
+        # Extract token from meta if not provided directly
+        token = qasp_token
+        if token is None and meta is not None:
+            try:
+                token = extract_qasp_token(meta)
+            except MCPTokenExtractionError as e:
+                raise CapabilityError(f"QASP token required: {e}") from e
+
+        if token is None:
+            raise CapabilityError("No QASP token required")
+
+        # Verify token signature & expiry
+        if self._issuer_public_key is not None:
+            verify_token(token, self._issuer_public_key, crl=self._revocation_checker)
+
+        # Check resource URI
+        expected_uri = tool_name_to_resource_uri(name)
+        if token.resource_uri != expected_uri:
+            raise CapabilityError(
+                f"Resource URI mismatch: token has '{token.resource_uri}', "
+                f"expected '{expected_uri}'"
+            )
+
+        # Check "execute" verb
+        if "execute" not in token.verbs:
+            raise CapabilityError("Token missing required 'execute' verb")
+
+        return self._backend.execute_tool(name, arguments)
+
+    async def _call_tool_remote(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        qasp_token: CapabilityToken | None,
+    ) -> Any:
+        """Async remote-session path."""
         if not self._connected or self._session is None:
             raise MCPConnectionError("Bridge not connected")
+
+        if qasp_token is None:
+            raise MCPAuthorizationError("QASP token required")
 
         mapping = self._tool_mappings.get(name)
         if mapping is None:

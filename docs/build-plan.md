@@ -179,11 +179,11 @@
 - Test revocation cascade: revoke root token → all descendants invalidated across servers
 
 ### Week 3 Checkpoint
-- [ ] Full trust scoring engine: audit VCs + Bayesian reputation + behavioral FSM
-- [ ] Composite trust score computed and updated in real-time
-- [ ] Metered resource accounting with hash-chained dual-signed receipts
-- [ ] Token revocation with cascade propagation
-- [ ] Service discovery via well-known endpoint and mDNS  
+- [x] Full trust scoring engine: audit VCs + Bayesian reputation + behavioral FSM
+- [x] Composite trust score computed and updated in real-time
+- [x] Metered resource accounting with hash-chained dual-signed receipts
+- [x] Token revocation with cascade propagation
+- [x] Service discovery via well-known endpoint and mDNS
 
 ---
 
@@ -229,10 +229,10 @@
 - Payment test: agent consumes resources, micropayments settled via payment channel
 
 ### Week 4 Checkpoint
-- [ ] MCP bridge: QASP agents accessible as MCP servers and vice versa
-- [ ] A2A bridge: QASP agents discoverable via Agent Cards, tasks flow through QASP
-- [ ] Payment channels operational with signed state updates
-- [ ] Dispute resolution Auditor service working  
+- [x] MCP bridge: QASP agents accessible as MCP servers and vice versa
+- [x] A2A bridge: QASP agents discoverable via Agent Cards, tasks flow through QASP
+- [x] Payment channels operational with signed state updates
+- [x] Dispute resolution Auditor service working
 
 ---
 
@@ -287,11 +287,11 @@
 - Performance benchmarks: handshake latency, token create/verify time, delegation chain depth vs. verification time
 
 ### Week 5 Checkpoint
-- [ ] All 4 demo scenarios running end-to-end
-- [ ] Downgrade resistance enforced
-- [ ] Tool-chaining firebreaks working
-- [ ] Security test suite passing
-- [ ] Performance benchmarks documented  
+- [x] All 4 demo scenarios running end-to-end
+- [x] Downgrade resistance enforced
+- [x] Tool-chaining firebreaks working
+- [x] Security test suite passing
+- [x] Performance benchmarks documented  
 
 ---
 
@@ -346,14 +346,14 @@
 - Tag `v0.1.0`, push to PyPI, publish documentation
 
 ### Week 6 Checkpoint
-- [ ] ProVerif model verifying authentication, secrecy, forward secrecy
-- [ ] Tamarin model verifying delegation safety
-- [ ] Complete protocol specification document
-- [ ] did:qasp method specification
-- [ ] Trust scoring specification
+- [x] ProVerif model verifying authentication, secrecy, forward secrecy
+- [x] Tamarin model verifying delegation safety
+- [x] Complete protocol specification document
+- [x] did:qasp method specification
+- [x] Trust scoring specification
 - [ ] PyPI package published
-- [ ] Conformance test suite with Docker harness
-- [ ] All 4 demo scenarios as runnable examples  
+- [x] Conformance test suite with Docker harness
+- [x] All 4 demo scenarios as runnable examples
 
 ---
 

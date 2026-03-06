@@ -21,6 +21,7 @@ from qasp.crypto.signatures import sign, verify
 from qasp.identity.did import DIDRegistry, get_registry
 
 from .exceptions import AdvertisementError, DiscoveryError, DiscoveryTimeoutError
+from .registry import AgentRegistry, RegistryQuery
 
 if TYPE_CHECKING:
     from qasp.protocol.connection import QASPConnection
@@ -202,10 +203,12 @@ class DiscoveryClient:
         local_did: str,
         secret_key: bytes,
         registry: DIDRegistry | None = None,
+        agent_registry: AgentRegistry | None = None,
     ) -> None:
         self._did = local_did
         self._secret_key = secret_key
         self._registry = registry if registry is not None else get_registry()
+        self._agent_registry = agent_registry
         self._known_endpoints: dict[str, ServiceEndpoint] = {}
         self._advertisements: dict[str, CapabilityAdvertisement] = {}
 
@@ -300,6 +303,52 @@ class DiscoveryClient:
         except RuntimeError:
             pass  # No event loop available
 
+    def discover_from_registry(
+        self,
+        capability: str | None = None,
+        min_trust_score: float = 0.0,
+        verbs: frozenset[str] | None = None,
+        max_results: int = 100,
+    ) -> list[ServiceEndpoint]:
+        """Discover services from the agent registry.
+
+        Args:
+            capability: Capability URI pattern (supports wildcards).
+            min_trust_score: Minimum trust score threshold.
+            verbs: Required verbs for matching capabilities.
+            max_results: Maximum number of results.
+
+        Returns:
+            List of matching service endpoints.
+        """
+        if self._agent_registry is None:
+            return []
+
+        query = RegistryQuery(
+            capability=capability or "",
+            min_trust=min_trust_score,
+            verbs=verbs or frozenset(),
+            max_results=max_results,
+        )
+        response = self._agent_registry.query(query)
+
+        endpoints: list[ServiceEndpoint] = []
+        for entry in response.entries:
+            host, port = entry.endpoint
+            endpoints.append(
+                ServiceEndpoint(
+                    did=entry.agent_did,
+                    host=host,
+                    port=port,
+                    capabilities=frozenset(
+                        ce.resource_uri for ce in entry.capabilities
+                    ),
+                    last_seen=datetime.fromtimestamp(entry.timestamp),
+                    trust_score=entry.trust_score,
+                )
+            )
+        return endpoints
+
     async def discover(
         self,
         capability: str | None = None,
@@ -308,8 +357,8 @@ class DiscoveryClient:
     ) -> list[ServiceEndpoint]:
         """Discover available services.
 
-        Evicts expired advertisements, drains the mDNS queue, then
-        filters by capability and trust score.
+        Evicts expired advertisements, drains the mDNS queue, merges
+        registry results, then filters by capability and trust score.
 
         Args:
             capability: Optional required capability filter.
@@ -336,14 +385,27 @@ class DiscoveryClient:
             except asyncio.QueueEmpty:
                 break
 
-        # Filter
+        # Filter local/mDNS endpoints
         results: list[ServiceEndpoint] = []
+        seen_dids: set[str] = set()
         for ep in self._known_endpoints.values():
             if capability and capability not in ep.capabilities:
                 continue
             if ep.trust_score is not None and ep.trust_score < min_trust_score:
                 continue
             results.append(ep)
+            seen_dids.add(ep.did)
+
+        # Merge registry results (deduplicate by DID)
+        if self._agent_registry is not None:
+            registry_eps = self.discover_from_registry(
+                capability=capability,
+                min_trust_score=min_trust_score,
+            )
+            for ep in registry_eps:
+                if ep.did not in seen_dids:
+                    results.append(ep)
+                    seen_dids.add(ep.did)
 
         return results
 

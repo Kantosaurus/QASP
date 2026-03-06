@@ -108,3 +108,29 @@ def sample_code_hash() -> bytes:
 def different_code_hash() -> bytes:
     """Generate a different SHA-384 code version hash (48 bytes)."""
     return hashlib.sha384(b"sample_code_version_2.0.0").digest()
+
+
+# =============================================================================
+# Reputation Model Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def reputation_model():  # noqa: ANN201
+    """Create a fresh ReputationModel with uniform prior."""
+    from qasp.trust.reputation import ReputationModel
+
+    return ReputationModel()
+
+
+# =============================================================================
+# Behavioral Verifier Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def behavioral_verifier(agent_did: DID):  # noqa: ANN201
+    """Create a BehavioralVerifier for the test agent."""
+    from qasp.trust.behavioral import BehavioralVerifier
+
+    return BehavioralVerifier(did=str(agent_did))

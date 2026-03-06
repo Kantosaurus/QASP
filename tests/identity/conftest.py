@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from qasp.crypto import signatures
-from qasp.identity import DID, create_did
+from qasp.identity import DID, DIDDocument, create_did
+from qasp.identity.resolver import InMemoryBackend, SQLiteBackend
 
 
 # =============================================================================
@@ -91,3 +92,35 @@ def sample_second_agent_did(second_agent_public_key: bytes) -> DID:
     """Create a DID for the second agent."""
     did, _ = create_did(second_agent_public_key)
     return did
+
+
+# =============================================================================
+# DID Document Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def sample_did_document(agent_public_key: bytes) -> DIDDocument:
+    """Create a DIDDocument from agent's public key."""
+    _, document = create_did(agent_public_key)
+    return document
+
+
+# =============================================================================
+# Resolver Backend Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def in_memory_backend() -> InMemoryBackend:
+    """Fresh in-memory backend."""
+    return InMemoryBackend()
+
+
+@pytest.fixture
+def sqlite_backend(tmp_path: object) -> SQLiteBackend:
+    """SQLite backend with temp file."""
+    import pathlib
+
+    db_path = pathlib.Path(str(tmp_path)) / "test_dht.db"
+    return SQLiteBackend(str(db_path))

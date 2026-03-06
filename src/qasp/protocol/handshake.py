@@ -28,6 +28,12 @@ from typing import TYPE_CHECKING
 
 from qasp.crypto import hybrid, kem, signatures
 from qasp.crypto.kdf import derive_qasp_session_key
+from qasp.crypto.suites import (
+    PQ_SUITE_IDS,
+    SUITE_HYBRID_TRANSITION,
+    SUITE_PQ_STRICT,
+    get_default_registry,
+)
 from qasp.framing.messages import ClientAuth, ClientHello, ServerHello
 
 if TYPE_CHECKING:
@@ -50,7 +56,7 @@ __all__ = [
 NONCE_SIZE = 32  # Size of client/server nonce in bytes
 SESSION_ID_SIZE = 32  # Size of session ID in bytes
 DEFAULT_PROTOCOL_VERSION = (1, 0)
-DEFAULT_CIPHER_SUITE = 1  # ML-KEM-768 + ML-DSA-65 + AES-256-GCM
+DEFAULT_CIPHER_SUITE = SUITE_PQ_STRICT  # ML-KEM-768 + ML-DSA-65 + AES-256-GCM
 
 
 # =============================================================================
@@ -78,6 +84,7 @@ class HandshakeErrorType(Enum):
     AUTH_FAILED = auto()
     KEM_FAILED = auto()
     TIMEOUT = auto()
+    UPGRADE_REQUIRED = auto()
 
 
 # =============================================================================
@@ -100,7 +107,7 @@ class HandshakeConfig:
     """
 
     protocol_version: tuple[int, int] = DEFAULT_PROTOCOL_VERSION
-    supported_cipher_suites: tuple[int, ...] = (DEFAULT_CIPHER_SUITE,)
+    supported_cipher_suites: tuple[int, ...] = (SUITE_HYBRID_TRANSITION,)
     enable_hybrid: bool = True
     initial_timeout_ms: int = 5000
     max_timeout_ms: int = 60000
@@ -176,7 +183,8 @@ class TranscriptBuilder:
         self._parts.append(client_nonce)
         self._parts.append(kem_public_key)
         self._parts.append(sig_public_key)
-        self._parts.append(bytes(cipher_suites))
+        suite_bytes = b"".join(s.to_bytes(2, "big") for s in cipher_suites)
+        self._parts.append(suite_bytes)
         self._client_hello_end = len(self._parts)
 
     def add_server_hello_presig(
@@ -194,7 +202,7 @@ class TranscriptBuilder:
         self._parts.append(kem_ciphertext)
         self._parts.append(kem_public_key)
         self._parts.append(sig_public_key)
-        self._parts.append(bytes([selected_suite]))
+        self._parts.append(selected_suite.to_bytes(2, "big"))
         self._server_hello_presig_end = len(self._parts)
 
     def add_server_signature(self, signature: bytes) -> None:
@@ -433,9 +441,13 @@ class Handshake:
         # Add server signature to transcript
         self._transcript.add_server_signature(server_hello.signature)
 
+        # Suite-aware KEM dispatch
+        selected_suite_info = get_default_registry().lookup(self._selected_suite)
+        use_hybrid = selected_suite_info.uses_hybrid_kem
+
         # Decapsulate shared secret
         try:
-            if self._config.enable_hybrid:
+            if use_hybrid:
                 # Hybrid decapsulation
                 self._shared_secret = hybrid.decapsulate(
                     self._kem_keypair,
@@ -458,7 +470,7 @@ class Handshake:
         # Prepare the KEM ciphertext for server's KEM public key
         # This provides forward secrecy from the client side as well
         try:
-            if self._config.enable_hybrid:
+            if use_hybrid:
                 client_kem_ct, client_shared = hybrid.encapsulate(
                     server_hello.kem_public_key
                 )
@@ -505,7 +517,7 @@ class Handshake:
         combined_shared = self._shared_secret + client_shared
 
         # Derive session key
-        if self._config.enable_hybrid:
+        if use_hybrid:
             # Split hybrid shared secret (X25519 || ML-KEM)
             x25519_ss = combined_shared[:32]
             mlkem_ss = combined_shared[32:64]
@@ -613,6 +625,17 @@ class Handshake:
                 alert_code=71,
             )
 
+        # Downgrade resistance: PQ-capable server rejects classical-only client
+        server_has_pq = bool(set(self._config.supported_cipher_suites) & PQ_SUITE_IDS)
+        client_has_pq = bool(set(client_hello.cipher_suites) & PQ_SUITE_IDS)
+        if server_has_pq and not client_has_pq:
+            self._state = HandshakeState.FAILED
+            return HandshakeFailure(
+                error_type=HandshakeErrorType.UPGRADE_REQUIRED,
+                message="Server requires post-quantum capable cipher suite",
+                alert_code=72,
+            )
+
         # Select cipher suite (prefer our order)
         for suite in self._config.supported_cipher_suites:
             if suite in common_suites:
@@ -636,9 +659,13 @@ class Handshake:
             cipher_suites=client_hello.cipher_suites,
         )
 
+        # Suite-aware KEM dispatch
+        selected_suite_info = get_default_registry().lookup(self._selected_suite)
+        use_hybrid = selected_suite_info.uses_hybrid_kem
+
         # Encapsulate to client's public key
         try:
-            if self._config.enable_hybrid:
+            if use_hybrid:
                 kem_ciphertext, self._shared_secret = hybrid.encapsulate(
                     client_hello.kem_public_key
                 )
@@ -655,7 +682,7 @@ class Handshake:
             )
 
         # Get our KEM public key
-        if self._config.enable_hybrid:
+        if use_hybrid:
             our_kem_pk = self._kem_keypair.public_key
         else:
             our_kem_pk = self._kem_keypair.mlkem_public
@@ -745,9 +772,13 @@ class Handshake:
                 alert_code=51,
             )
 
+        # Suite-aware KEM dispatch
+        selected_suite_info = get_default_registry().lookup(self._selected_suite)
+        use_hybrid = selected_suite_info.uses_hybrid_kem
+
         # Decapsulate client's KEM ciphertext
         try:
-            if self._config.enable_hybrid:
+            if use_hybrid:
                 client_shared = hybrid.decapsulate(
                     self._kem_keypair,
                     client_auth.kem_ciphertext,
@@ -769,7 +800,7 @@ class Handshake:
         combined_shared = self._shared_secret + client_shared
 
         # Derive session key
-        if self._config.enable_hybrid:
+        if use_hybrid:
             # Split hybrid shared secret (X25519 || ML-KEM)
             x25519_ss = combined_shared[:32]
             mlkem_ss = combined_shared[32:64]

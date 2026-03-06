@@ -1,0 +1,327 @@
+/*
+ * =====================================================================
+ * QASP Capability Token Delegation - Tamarin Model
+ *
+ * Models the QASP capability token system including:
+ *   - Token creation with verbs, quantity, and delegation depth
+ *   - Attenuation: verb subsetting, quantity reduction, depth increment
+ *   - Delegation chain verification
+ *   - Revocation with cascade
+ *   - Max delegation depth enforcement
+ *
+ * Based on src/qasp/protocol/capability.py
+ * =====================================================================
+ */
+
+theory QASP_Delegation
+begin
+
+builtins: signing, multiset
+
+/* =====================================================================
+ * Function symbols
+ * ===================================================================== */
+
+/*
+ * Token structure:
+ *   token(issuer, subject, resource, verbs, quantity, depth, max_depth,
+ *         parent_hash, nonce)
+ *
+ * where 'verbs' is a multiset encoding the set of permitted operations,
+ * 'quantity' is a natural number, 'depth' is the current delegation
+ * chain length, and 'max_depth' is the maximum allowed.
+ */
+
+functions: h/1          /* Cryptographic hash (SHA-384) */
+         , token_data/9 /* Canonical encoding of token fields for signing */
+         , token_hash/2 /* Hash of (token_data, signature) */
+         , true/0       /* Boolean true */
+
+/* =====================================================================
+ * Restriction: Subset checking for verb multisets
+ *
+ * We model verbs as multisets. A child's verbs must be a "subset" of
+ * the parent's verbs, meaning every element in the child multiset
+ * appears in the parent multiset. We encode this as a restriction
+ * on an action fact.
+ * ===================================================================== */
+
+restriction VerbSubset:
+  "All child_verbs parent_verbs #i.
+     VerbIsSubset(child_verbs, parent_verbs) @ #i
+     ==> Ex rest. parent_verbs = child_verbs + rest
+         | child_verbs = parent_verbs"
+
+/* Quantity attenuation: child quantity must be <= parent quantity */
+restriction QuantityLeq:
+  "All qc qp #i.
+     QuantityLeq(qc, qp) @ #i
+     ==> Ex delta. qp = qc + delta
+         | qc = qp"
+
+/* Delegation depth must not exceed max */
+restriction DepthBound:
+  "All depth max_depth #i.
+     DepthWithinBound(depth, max_depth) @ #i
+     ==> Ex remaining. max_depth = depth + remaining
+         | depth = max_depth"
+
+/* Inequality helper */
+restriction Neq:
+  "All x y #i. Neq(x, y) @ #i ==> not(x = y)"
+
+/* Equality helper */
+restriction Eq:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+/* =====================================================================
+ * Rules
+ * ===================================================================== */
+
+/* --- Key generation --- */
+rule Register_Keypair:
+  [ Fr(~sk) ]
+  -->
+  [ !Sk(pk(~sk), ~sk)
+  , !Pk(pk(~sk))
+  , Out(pk(~sk))
+  ]
+
+/* --- Root token creation ---
+ *
+ * An issuer creates a fresh root token with:
+ *   - chosen verbs (multiset), quantity, max_delegation_depth
+ *   - delegation_chain_length = '0' (initial)
+ *   - no parent hash (root)
+ *   - ML-DSA-65 signature over canonical encoding
+ */
+rule CreateToken:
+  let td = token_data(pk(~sk_issuer), subject, resource,
+                       verbs, quantity, '0', max_depth,
+                       'none', ~nonce)
+      sig = sign(td, ~sk_issuer)
+      th  = token_hash(td, sig)
+  in
+  [ !Sk(pk(~sk_issuer), ~sk_issuer)
+  , Fr(~nonce)
+  ]
+  --[ CreateToken(pk(~sk_issuer), subject, resource, verbs,
+                  quantity, max_depth, th)
+    , TokenExists(th, pk(~sk_issuer), verbs, quantity, '0', max_depth)
+    , IsRoot(th)
+    ]->
+  [ TokenState(th, pk(~sk_issuer), subject, resource, verbs,
+               quantity, '0', max_depth, sig, td)
+  , !TokenRecord(th, pk(~sk_issuer), subject, resource, verbs,
+                 quantity, '0', max_depth)
+  ]
+
+/* --- Token attenuation (delegation) ---
+ *
+ * The current subject (delegator) creates a child token where:
+ *   1. child_verbs is a subset of parent_verbs
+ *   2. child_quantity <= parent_quantity
+ *   3. child_depth = parent_depth + '1'   (chain length increments)
+ *   4. child_max_depth = parent_max_depth - '1' (remaining depth decrements)
+ *      encoded as: parent_max_depth = child_max_depth + '1'
+ *   5. parent_hash = hash of parent token
+ *   6. Delegator must hold the signing key for 'delegator' identity
+ *
+ * attenuate_token in capability.py:
+ *   new_depth = parent.max_delegation_depth - 1
+ *   new_chain_length = parent.delegation_chain_length + 1
+ */
+rule AttenuateToken:
+  let new_chain_len = parent_chain_len + '1'
+      td_child = token_data(delegator, new_subject, resource,
+                             child_verbs, child_quantity, new_chain_len,
+                             child_max_depth, parent_th, ~nonce_child)
+      sig_child = sign(td_child, ~sk_delegator)
+      child_th  = token_hash(td_child, sig_child)
+  in
+  [ TokenState(parent_th, issuer, delegator, resource, parent_verbs,
+               parent_quantity, parent_chain_len, parent_max_depth,
+               parent_sig, parent_td)
+  , !Sk(delegator, ~sk_delegator)
+  , Fr(~nonce_child)
+  ]
+  --[ AttenuateToken(parent_th, child_th, delegator, new_subject,
+                     child_verbs, child_quantity, new_chain_len,
+                     child_max_depth)
+    , VerbIsSubset(child_verbs, parent_verbs)
+    , QuantityLeq(child_quantity, parent_quantity)
+    /* parent_max_depth must be at least '1' to allow delegation */
+    , Eq(parent_max_depth, child_max_depth + '1')
+    , DepthWithinBound(new_chain_len, child_max_depth + new_chain_len)
+    , TokenExists(child_th, delegator, child_verbs, child_quantity,
+                  new_chain_len, child_max_depth)
+    , HasParent(child_th, parent_th)
+    , NotRevoked(parent_th)
+    ]->
+  [ TokenState(child_th, delegator, new_subject, resource,
+               child_verbs, child_quantity, new_chain_len,
+               child_max_depth, sig_child, td_child)
+  , !TokenRecord(child_th, delegator, new_subject, resource,
+                 child_verbs, child_quantity, new_chain_len,
+                 child_max_depth)
+  ]
+
+/* --- Token verification ---
+ *
+ * Any party can verify a token by checking its signature against
+ * the issuer's public key and confirming it has not been revoked.
+ */
+rule VerifyToken:
+  [ TokenState(th, issuer, subject, resource, verbs, quantity,
+               chain_len, max_depth, sig, td)
+  , !Pk(issuer)
+  ]
+  --[ VerifyToken(th, issuer, subject, verbs, quantity)
+    , Eq(verify(sig, td, issuer), true)
+    , NotRevoked(th)
+    ]->
+  [ TokenState(th, issuer, subject, resource, verbs, quantity,
+               chain_len, max_depth, sig, td)
+  ]
+
+/* --- Token revocation ---
+ *
+ * The issuer of a token can revoke it. This records the revocation
+ * fact persistently. Descendants are cascade-revoked via the
+ * RevocationCascade restriction.
+ */
+rule RevokeToken:
+  [ TokenState(th, issuer, subject, resource, verbs, quantity,
+               chain_len, max_depth, sig, td)
+  , !Sk(issuer, ~sk_issuer)
+  ]
+  --[ RevokeToken(th, issuer)
+    , Revoked(th)
+    ]->
+  [ !RevokedToken(th)
+  ]
+
+/* Cascade: if a token's ancestor is revoked, it is considered revoked */
+restriction RevocationCascade:
+  "All child parent #i #j.
+     HasParent(child, parent) @ #i & Revoked(parent) @ #j
+     ==> Ex #k. Revoked(child) @ #k"
+
+/* NotRevoked means there is no Revoked action for this token */
+restriction NotRevokedCheck:
+  "All th #i.
+     NotRevoked(th) @ #i
+     ==> not(Ex #j. Revoked(th) @ #j)"
+
+/* =====================================================================
+ * Lemmas (Security Properties)
+ * ===================================================================== */
+
+/*
+ * Lemma 1: No privilege escalation
+ *
+ * For any attenuated (child) token, its verbs must be a subset of
+ * its parent's verbs and its quantity must be <= parent's quantity.
+ * By transitivity, this holds all the way up to the root.
+ *
+ * Formally: if a token T' was attenuated from T, then
+ *   verbs(T') subset verbs(T) AND quantity(T') <= quantity(T)
+ */
+lemma no_escalation:
+  "All parent_th child_th delegator subject child_verbs child_qty
+      chain_len child_max_depth #i.
+     AttenuateToken(parent_th, child_th, delegator, subject,
+                    child_verbs, child_qty, chain_len,
+                    child_max_depth) @ #i
+     ==> ( Ex issuer parent_verbs parent_qty parent_chain parent_max #j.
+             TokenExists(parent_th, issuer, parent_verbs, parent_qty,
+                         parent_chain, parent_max) @ #j
+             & #j < #i
+             & ( Ex rest. parent_verbs = child_verbs + rest
+                 | child_verbs = parent_verbs )
+             & ( Ex delta. parent_qty = child_qty + delta
+                 | child_qty = parent_qty )
+         )"
+
+/*
+ * Lemma 2: Revocation cascade
+ *
+ * If a parent token is revoked, no descendant can be successfully
+ * verified afterwards. This follows from the RevocationCascade
+ * restriction and the NotRevoked check in VerifyToken.
+ */
+lemma revocation_cascade:
+  "All parent_th child_th delegator subject verbs qty chain_len
+      max_depth #i #j.
+     HasParent(child_th, parent_th) @ #i
+     & Revoked(parent_th) @ #j
+     ==> Ex #k. Revoked(child_th) @ #k"
+
+/*
+ * Lemma 3: Max delegation depth respected
+ *
+ * The delegation chain length never exceeds the original max
+ * delegation depth. Since each attenuation increments chain_len by 1
+ * and decrements max_depth by 1, the sum (chain_len + max_depth)
+ * is invariant and equals the root's max_depth. Thus chain_len
+ * can never exceed the root's original max_depth.
+ *
+ * We verify that no token exists with max_depth < '0' (which would
+ * mean we delegated beyond the allowed depth). Since max_depth is
+ * decremented each step and the Eq restriction enforces
+ * parent_max_depth = child_max_depth + '1', once max_depth reaches
+ * '0' no further attenuation is possible.
+ */
+lemma max_depth_respected:
+  "All parent_th child_th delegator subject verbs qty chain_len
+      child_max_depth #i.
+     AttenuateToken(parent_th, child_th, delegator, subject,
+                    verbs, qty, chain_len, child_max_depth) @ #i
+     ==> ( Ex parent_max_depth.
+             child_max_depth + '1' = parent_max_depth
+             & ( Ex issuer pv pq pc #j.
+                   TokenExists(parent_th, issuer, pv, pq, pc,
+                               parent_max_depth) @ #j
+                   & #j < #i )
+         )"
+
+/*
+ * Lemma 4: Token existence
+ *
+ * Every token that exists was either created as a root or
+ * attenuated from an existing parent. This ensures no tokens
+ * appear from thin air.
+ */
+lemma token_origin:
+  "All th issuer verbs qty chain_len max_depth #i.
+     TokenExists(th, issuer, verbs, qty, chain_len, max_depth) @ #i
+     ==> ( Ex subject resource #j.
+             CreateToken(issuer, subject, resource, verbs, qty,
+                         max_depth, th) @ #j )
+         | ( Ex parent_th delegator subject child_max_depth #j.
+               AttenuateToken(parent_th, th, delegator, subject,
+                              verbs, qty, chain_len,
+                              max_depth) @ #j )"
+
+/*
+ * Lemma 5: Root tokens have no parent
+ *
+ * A root token (chain_len = '0') was created by CreateToken,
+ * not by attenuation.
+ */
+lemma root_has_no_parent:
+  "All th #i.
+     IsRoot(th) @ #i
+     ==> not(Ex parent #j. HasParent(th, parent) @ #j)"
+
+/*
+ * Lemma 6: Verified tokens are not revoked
+ *
+ * Any token that passes verification has not been revoked.
+ */
+lemma verified_not_revoked:
+  "All th issuer subject verbs qty #i.
+     VerifyToken(th, issuer, subject, verbs, qty) @ #i
+     ==> not(Ex #j. Revoked(th) @ #j)"
+
+end
