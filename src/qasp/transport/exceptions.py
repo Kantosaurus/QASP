@@ -15,6 +15,9 @@ __all__ = [
     "SendError",
     "ReceiveError",
     "FramingError",
+    "DiscoveryError",
+    "AdvertisementError",
+    "DiscoveryTimeoutError",
 ]
 
 
@@ -80,3 +83,15 @@ class FramingError(TransportError):
     This includes invalid length prefixes, oversized messages,
     or malformed frame data.
     """
+
+
+class DiscoveryError(TransportError):
+    """Base exception for discovery failures."""
+
+
+class AdvertisementError(DiscoveryError):
+    """Raised for invalid, expired, or forged advertisements."""
+
+
+class DiscoveryTimeoutError(DiscoveryError):
+    """Raised when a discovery operation times out."""

@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import socket
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
-from unittest.mock import Mock
+from typing import TYPE_CHECKING
 
 import pytest
 
 if TYPE_CHECKING:
+    from qasp.transport.discover import CapabilityAdvertisement
     from qasp.transport.tcp import TCPServer, TCPTransport
 
 
@@ -147,3 +148,32 @@ async def multi_echo_server(
     await server.start("127.0.0.1", 0)
     yield server
     await server.stop()
+
+
+@pytest.fixture
+def discovery_keypair() -> tuple[bytes, bytes]:
+    """Real ML-DSA-65 keypair for discovery integration tests."""
+    from qasp.crypto.signatures import generate_keypair
+
+    return generate_keypair()
+
+
+@pytest.fixture
+def mock_did() -> str:
+    """Mock DID string for testing."""
+    return "did:qasp:test1234567890abcdef"
+
+
+@pytest.fixture
+def sample_advertisement(mock_did: str) -> CapabilityAdvertisement:
+    """Pre-built unsigned CapabilityAdvertisement for testing."""
+    from qasp.transport.discover import CapabilityAdvertisement
+
+    return CapabilityAdvertisement(
+        did=mock_did,
+        endpoints=(("127.0.0.1", 8443),),
+        capabilities=frozenset({"invoke", "delegate"}),
+        ttl=300,
+        created_at=time.time(),
+        signature=b"",
+    )
