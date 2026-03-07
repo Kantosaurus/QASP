@@ -20,6 +20,7 @@ from qasp.trust.exceptions import (
     EntryNotFoundError,
     InvalidVCError,
 )
+from qasp.trust.registry import SQLiteRegistryBackend
 
 # =============================================================================
 # TrustEntry Tests
@@ -739,3 +740,87 @@ class TestGetTrustRegistry:
         # All should be the same instance
         first = registries[0]
         assert all(r is first for r in registries)
+
+
+# =============================================================================
+# SQLite Registry Backend Tests
+# =============================================================================
+
+
+class TestSQLiteRegistryBackend:
+    """Tests for TrustRegistry with SQLite backend."""
+
+    def test_register_and_lookup(self, agent_did: DID) -> None:
+        backend = SQLiteRegistryBackend(":memory:")
+        registry = TrustRegistry(backend=backend)
+        entry = registry.register(agent_did)
+        assert entry.did == agent_did
+        looked_up = registry.lookup(agent_did)
+        assert looked_up is not None
+        assert looked_up.did == agent_did
+        backend.close()
+
+    def test_update_reputation(self, agent_did: DID) -> None:
+        backend = SQLiteRegistryBackend(":memory:")
+        registry = TrustRegistry(backend=backend)
+        registry.register(agent_did)
+        entry = registry.update_reputation(agent_did, success=True)
+        assert entry.reputation_alpha == 2.0
+        assert entry.total_interactions == 1
+        backend.close()
+
+    def test_remove_entry(self, agent_did: DID) -> None:
+        backend = SQLiteRegistryBackend(":memory:")
+        registry = TrustRegistry(backend=backend)
+        registry.register(agent_did)
+        assert registry.remove(agent_did)
+        assert agent_did not in registry
+        backend.close()
+
+    def test_clear(self, agent_did: DID, second_agent_did: DID) -> None:
+        backend = SQLiteRegistryBackend(":memory:")
+        registry = TrustRegistry(backend=backend)
+        registry.register(agent_did)
+        registry.register(second_agent_did)
+        registry.clear()
+        assert len(registry) == 0
+        backend.close()
+
+    def test_add_audit_vc(
+        self,
+        auditor_did: DID,
+        auditor_secret_key: bytes,
+        agent_did: DID,
+        sample_code_hash: bytes,
+    ) -> None:
+        backend = SQLiteRegistryBackend(":memory:")
+        registry = TrustRegistry(backend=backend)
+        registry.register(agent_did)
+        vc = create_audit_vc(
+            issuer_did=auditor_did,
+            issuer_secret_key=auditor_secret_key,
+            agent_did=agent_did,
+            audit_scope="Audit",
+            code_version_hash=sample_code_hash,
+            audit_result="PASSED",
+            slsa_level=SLSALevel.LEVEL_2,
+        )
+        entry = registry.add_audit_vc(agent_did, vc)
+        assert len(entry.audit_vcs) == 1
+        looked_up_vc = registry.lookup_vc(vc.id)
+        assert looked_up_vc is not None
+        backend.close()
+
+    def test_all_entries(self, agent_did: DID, second_agent_did: DID) -> None:
+        backend = SQLiteRegistryBackend(":memory:")
+        registry = TrustRegistry(backend=backend)
+        registry.register(agent_did)
+        registry.register(second_agent_did)
+        entries = registry.all_entries()
+        assert len(entries) == 2
+        backend.close()
+
+    def test_default_backend_is_in_memory(self, agent_did: DID) -> None:
+        registry = TrustRegistry()
+        entry = registry.register(agent_did)
+        assert entry.did == agent_did

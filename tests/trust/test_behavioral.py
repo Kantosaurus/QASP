@@ -8,10 +8,12 @@ import pytest
 
 from qasp.crypto.signatures import generate_keypair
 from qasp.trust.behavioral import (
+    BehaviorDistribution,
     BehaviorEvent,
     BehaviorState,
     BehaviorType,
     BehavioralVerifier,
+    DriftDetector,
     EVENT_STATE_MAP,
     PERMITTED_TRANSITIONS,
     CapabilityManifest,
@@ -252,3 +254,97 @@ class TestBehavioralVerifierAnalysis:
         v.record_event(_make_event(BehaviorType.RESPONSE))
         anomalies = v.detect_anomalies()
         assert len(anomalies) == 0
+
+
+# =============================================================================
+# Drift Detection Tests
+# =============================================================================
+
+
+class TestDriftDetection:
+    """Tests for BehaviorDistribution and DriftDetector."""
+
+    def test_identical_distributions_zero_drift(self) -> None:
+        """Identical distributions produce zero or near-zero drift."""
+        dist = BehaviorDistribution(probs={
+            BehaviorType.REQUEST: 0.5,
+            BehaviorType.RESPONSE: 0.5,
+        })
+        detector = DriftDetector(baseline=dist)
+        score = detector.compute_drift_score(dist)
+        assert score == pytest.approx(0.0, abs=1e-6)
+
+    def test_orthogonal_distributions_high_drift(self) -> None:
+        """Completely different distributions produce high drift."""
+        baseline = BehaviorDistribution(probs={BehaviorType.REQUEST: 1.0})
+        current = BehaviorDistribution(probs={BehaviorType.ERROR: 1.0})
+        detector = DriftDetector(baseline=baseline)
+        score = detector.compute_drift_score(current)
+        assert score > 0.5
+
+    def test_kl_divergence_non_negative(self) -> None:
+        """KL divergence is always non-negative."""
+        p = BehaviorDistribution(probs={
+            BehaviorType.REQUEST: 0.7, BehaviorType.RESPONSE: 0.3,
+        })
+        q = BehaviorDistribution(probs={
+            BehaviorType.REQUEST: 0.3, BehaviorType.RESPONSE: 0.7,
+        })
+        kl = DriftDetector.kl_divergence(p, q)
+        assert kl >= 0.0
+
+    def test_wasserstein_symmetric(self) -> None:
+        """Wasserstein distance is symmetric."""
+        p = BehaviorDistribution(probs={
+            BehaviorType.REQUEST: 0.8, BehaviorType.RESPONSE: 0.2,
+        })
+        q = BehaviorDistribution(probs={
+            BehaviorType.REQUEST: 0.2, BehaviorType.RESPONSE: 0.8,
+        })
+        d1 = DriftDetector.wasserstein_distance(p, q)
+        d2 = DriftDetector.wasserstein_distance(q, p)
+        assert d1 == pytest.approx(d2)
+
+    def test_distribution_from_events(self) -> None:
+        """distribution_from_events normalizes correctly."""
+        events = [
+            _make_event(BehaviorType.REQUEST),
+            _make_event(BehaviorType.REQUEST),
+            _make_event(BehaviorType.RESPONSE),
+            _make_event(BehaviorType.ERROR),
+        ]
+        dist = DriftDetector.distribution_from_events(events)
+        assert dist.probs[BehaviorType.REQUEST] == pytest.approx(0.5)
+        assert dist.probs[BehaviorType.RESPONSE] == pytest.approx(0.25)
+        assert dist.probs[BehaviorType.ERROR] == pytest.approx(0.25)
+
+    def test_distribution_from_empty_events(self) -> None:
+        """Empty event list produces empty distribution."""
+        dist = DriftDetector.distribution_from_events([])
+        assert dist.probs == {}
+
+    def test_threshold_scaling(self) -> None:
+        """Higher thresholds reduce normalized drift score."""
+        baseline = BehaviorDistribution(probs={BehaviorType.REQUEST: 1.0})
+        current = BehaviorDistribution(probs={BehaviorType.ERROR: 1.0})
+        d_low = DriftDetector(baseline=baseline, kl_threshold=1.0, wasserstein_threshold=0.5)
+        d_high = DriftDetector(baseline=baseline, kl_threshold=10.0, wasserstein_threshold=5.0)
+        assert d_low.compute_drift_score(current) >= d_high.compute_drift_score(current)
+
+    def test_behavioral_verifier_detect_drift(self) -> None:
+        """BehavioralVerifier.detect_drift integration test."""
+        v = BehavioralVerifier(did="did:test:drift1")
+        # Record enough events for drift detection (need >= 4)
+        for _ in range(5):
+            v.record_event(_make_event(BehaviorType.REQUEST))
+            v.record_event(_make_event(BehaviorType.RESPONSE))
+        # Same pattern throughout -> low drift
+        score = v.detect_drift()
+        assert 0.0 <= score <= 1.0
+        assert score < 0.5  # same pattern, expect low drift
+
+    def test_behavioral_verifier_detect_drift_too_few_events(self) -> None:
+        """detect_drift returns 0.0 with fewer than 4 events."""
+        v = BehavioralVerifier(did="did:test:drift2")
+        v.record_event(_make_event(BehaviorType.REQUEST))
+        assert v.detect_drift() == 0.0

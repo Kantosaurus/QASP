@@ -14,12 +14,20 @@ from qasp.crypto import kem
 from qasp.crypto.signatures import generate_keypair
 from qasp.identity.did import create_did
 from qasp.protocol.privacy import (
+    POE_SUCCESS,
+    POE_FAILURE,
+    POE_VIOLATION,
+    PoEChain,
+    PoEChainError,
+    ProofOfExecution,
     TraceDecryptionError,
     TraceEntry,
     TraceVerificationError,
     create_private_trace_entry,
+    create_proof_of_execution,
     decrypt_auditor_envelope,
     verify_args_hash,
+    verify_proof_of_execution,
     verify_trace_entry,
 )
 
@@ -369,3 +377,205 @@ class TestAuditorServiceDecrypt:
         )
         with pytest.raises(TraceDecryptionError, match="not configured"):
             service.decrypt_trace_arguments(trace_entry)
+
+
+# =============================================================================
+# TestProofOfExecution
+# =============================================================================
+
+
+class TestProofOfExecution:
+    """Tests for ProofOfExecution create/verify."""
+
+    def test_create_and_verify_roundtrip(self, signer_keypair: tuple[bytes, bytes]) -> None:
+        pk, sk = signer_keypair
+        poe = create_proof_of_execution(
+            agent_did="did:test:poe1",
+            action="exec",
+            resource="qasp://test/resource",
+            token_id=b"token123",
+            result=POE_SUCCESS,
+            arguments=b"hello world",
+            signer_sk=sk,
+        )
+        assert verify_proof_of_execution(poe, pk) is True
+
+    def test_wrong_key_fails(self, signer_keypair: tuple[bytes, bytes]) -> None:
+        _, sk = signer_keypair
+        poe = create_proof_of_execution(
+            agent_did="did:test:poe2",
+            action="read",
+            resource="qasp://test/r",
+            token_id=b"tok",
+            result=POE_FAILURE,
+            arguments=b"args",
+            signer_sk=sk,
+        )
+        wrong_pk, _ = generate_keypair()
+        with pytest.raises(TraceVerificationError):
+            verify_proof_of_execution(poe, wrong_pk)
+
+    def test_cbor_roundtrip(self, signer_keypair: tuple[bytes, bytes]) -> None:
+        _, sk = signer_keypair
+        poe = create_proof_of_execution(
+            agent_did="did:test:poe3",
+            action="exec",
+            resource="qasp://test/r",
+            token_id=b"tok",
+            result=POE_VIOLATION,
+            arguments=b"data",
+            signer_sk=sk,
+        )
+        restored = ProofOfExecution.from_cbor(poe.to_cbor())
+        assert restored.agent_did == poe.agent_did
+        assert restored.action == poe.action
+        assert restored.args_hash == poe.args_hash
+        assert restored.signature == poe.signature
+
+    def test_result_constants(self) -> None:
+        assert POE_SUCCESS == "success"
+        assert POE_FAILURE == "failure"
+        assert POE_VIOLATION == "violation"
+
+
+# =============================================================================
+# TestPoEChain
+# =============================================================================
+
+
+class TestPoEChain:
+    """Tests for PoEChain hash-linked chain."""
+
+    def test_first_entry(self, signer_keypair: tuple[bytes, bytes]) -> None:
+        _, sk = signer_keypair
+        chain = PoEChain()
+        poe = create_proof_of_execution(
+            agent_did="did:test:chain1",
+            action="exec",
+            resource="qasp://r",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"a",
+            signer_sk=sk,
+            prev_poe_hash=b"",
+        )
+        chain.append(poe)
+        assert len(chain) == 1
+        assert chain.latest_hash != b""
+
+    def test_chain_continuity(self, signer_keypair: tuple[bytes, bytes]) -> None:
+        _, sk = signer_keypair
+        chain = PoEChain()
+        poe1 = create_proof_of_execution(
+            agent_did="did:test:chain2",
+            action="exec",
+            resource="qasp://r",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"a",
+            signer_sk=sk,
+            prev_poe_hash=b"",
+        )
+        chain.append(poe1)
+
+        poe2 = create_proof_of_execution(
+            agent_did="did:test:chain2",
+            action="read",
+            resource="qasp://r2",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"b",
+            signer_sk=sk,
+            prev_poe_hash=chain.latest_hash,
+        )
+        chain.append(poe2)
+        assert len(chain) == 2
+
+    def test_broken_chain_raises(self, signer_keypair: tuple[bytes, bytes]) -> None:
+        _, sk = signer_keypair
+        chain = PoEChain()
+        poe1 = create_proof_of_execution(
+            agent_did="did:test:chain3",
+            action="exec",
+            resource="qasp://r",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"a",
+            signer_sk=sk,
+            prev_poe_hash=b"",
+        )
+        chain.append(poe1)
+
+        # Wrong prev_poe_hash
+        poe_bad = create_proof_of_execution(
+            agent_did="did:test:chain3",
+            action="read",
+            resource="qasp://r",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"b",
+            signer_sk=sk,
+            prev_poe_hash=b"wrong_hash",
+        )
+        with pytest.raises(PoEChainError):
+            chain.append(poe_bad)
+
+    def test_full_chain_verify(self, signer_keypair: tuple[bytes, bytes]) -> None:
+        pk, sk = signer_keypair
+        chain = PoEChain()
+        poe1 = create_proof_of_execution(
+            agent_did="did:test:chain4",
+            action="exec",
+            resource="qasp://r",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"a",
+            signer_sk=sk,
+            prev_poe_hash=b"",
+        )
+        chain.append(poe1)
+
+        poe2 = create_proof_of_execution(
+            agent_did="did:test:chain4",
+            action="read",
+            resource="qasp://r",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"b",
+            signer_sk=sk,
+            prev_poe_hash=chain.latest_hash,
+        )
+        chain.append(poe2)
+        assert chain.verify(pk) is True
+
+    def test_cbor_roundtrip(self, signer_keypair: tuple[bytes, bytes]) -> None:
+        pk, sk = signer_keypair
+        chain = PoEChain()
+        poe1 = create_proof_of_execution(
+            agent_did="did:test:chain5",
+            action="exec",
+            resource="qasp://r",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"a",
+            signer_sk=sk,
+            prev_poe_hash=b"",
+        )
+        chain.append(poe1)
+
+        poe2 = create_proof_of_execution(
+            agent_did="did:test:chain5",
+            action="read",
+            resource="qasp://r",
+            token_id=b"t",
+            result=POE_SUCCESS,
+            arguments=b"b",
+            signer_sk=sk,
+            prev_poe_hash=chain.latest_hash,
+        )
+        chain.append(poe2)
+
+        serialized = chain.to_cbor()
+        restored = PoEChain.from_cbor(serialized)
+        assert len(restored) == 2
+        assert restored.verify(pk) is True

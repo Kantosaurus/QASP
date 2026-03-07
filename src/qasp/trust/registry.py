@@ -1,25 +1,32 @@
 """Trust registry for agent trust information.
 
-This module implements a thread-safe in-memory trust registry for tracking
+This module implements a thread-safe trust registry for tracking
 agent trust information including Bayesian reputation scores, audit VCs,
-and behavioral metrics.
+and behavioral metrics.  Supports pluggable storage backends (in-memory
+or SQLite).
 """
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+import cbor2
 
 from qasp.identity.did import DID
-from qasp.trust.certification import AuditVC
+from qasp.trust.certification import AuditVC, _encode_vc_with_proof
 from qasp.trust.exceptions import DuplicateEntryError, EntryNotFoundError, InvalidVCError
 
 if TYPE_CHECKING:
     pass
 
 __all__ = [
+    "InMemoryRegistryBackend",
+    "RegistryBackend",
+    "SQLiteRegistryBackend",
     "TrustEntry",
     "TrustRegistry",
     "get_trust_registry",
@@ -102,18 +109,269 @@ class TrustEntry:
         return best_level / 3.0
 
 
+# =============================================================================
+# Registry Backend Protocol
+# =============================================================================
+
+
+@runtime_checkable
+class RegistryBackend(Protocol):
+    """Protocol for trust registry storage backends."""
+
+    def store_entry(self, did_string: str, entry: TrustEntry) -> None: ...
+    def fetch_entry(self, did_string: str) -> TrustEntry | None: ...
+    def remove_entry(self, did_string: str) -> bool: ...
+    def all_entries(self) -> list[TrustEntry]: ...
+    def contains(self, did_string: str) -> bool: ...
+    def count(self) -> int: ...
+    def clear(self) -> None: ...
+    def store_vc(self, vc_id: str, vc: AuditVC) -> None: ...
+    def fetch_vc(self, vc_id: str) -> AuditVC | None: ...
+    def remove_vc(self, vc_id: str) -> None: ...
+
+
+# =============================================================================
+# In-Memory Backend
+# =============================================================================
+
+
+class InMemoryRegistryBackend:
+    """Thread-safe in-memory trust registry backend."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[str, TrustEntry] = {}
+        self._vcs: dict[str, AuditVC] = {}
+
+    def store_entry(self, did_string: str, entry: TrustEntry) -> None:
+        with self._lock:
+            self._entries[did_string] = entry
+
+    def fetch_entry(self, did_string: str) -> TrustEntry | None:
+        with self._lock:
+            return self._entries.get(did_string)
+
+    def remove_entry(self, did_string: str) -> bool:
+        with self._lock:
+            if did_string in self._entries:
+                del self._entries[did_string]
+                return True
+            return False
+
+    def all_entries(self) -> list[TrustEntry]:
+        with self._lock:
+            return list(self._entries.values())
+
+    def contains(self, did_string: str) -> bool:
+        with self._lock:
+            return did_string in self._entries
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._vcs.clear()
+
+    def store_vc(self, vc_id: str, vc: AuditVC) -> None:
+        with self._lock:
+            self._vcs[vc_id] = vc
+
+    def fetch_vc(self, vc_id: str) -> AuditVC | None:
+        with self._lock:
+            return self._vcs.get(vc_id)
+
+    def remove_vc(self, vc_id: str) -> None:
+        with self._lock:
+            self._vcs.pop(vc_id, None)
+
+
+# =============================================================================
+# SQLite Backend
+# =============================================================================
+
+
+_TRUST_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS trust_entries (
+    did TEXT PRIMARY KEY,
+    entry_cbor BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_vcs (
+    vc_id TEXT PRIMARY KEY,
+    vc_cbor BLOB NOT NULL
+)"""
+
+
+class SQLiteRegistryBackend:
+    """SQLite-backed trust registry backend."""
+
+    def __init__(self, db_path: str = ":memory:") -> None:
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        for stmt in _TRUST_SCHEMA.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self._conn.execute(stmt)
+        self._conn.commit()
+
+    # -- serialization helpers ------------------------------------------------
+
+    def _serialize_entry(self, entry: TrustEntry) -> bytes:
+        """Serialize TrustEntry to CBOR, storing VC IDs as references."""
+        data = {
+            "did": str(entry.did),
+            "reputation_alpha": entry.reputation_alpha,
+            "reputation_beta": entry.reputation_beta,
+            "audit_vc_ids": [vc.id for vc in entry.audit_vcs],
+            "behavioral_score": entry.behavioral_score,
+            "total_interactions": entry.total_interactions,
+            "successful_interactions": entry.successful_interactions,
+            "last_interaction": entry.last_interaction.isoformat() if entry.last_interaction else None,
+            "flags": sorted(entry.flags),
+        }
+        return cbor2.dumps(data, canonical=True)
+
+    def _deserialize_entry(self, raw: bytes) -> TrustEntry:
+        """Deserialize TrustEntry from CBOR, loading VCs by reference."""
+        data = cbor2.loads(raw)
+        did = DID.parse(data["did"])
+        # Load referenced VCs
+        vcs: list[AuditVC] = []
+        for vc_id in data.get("audit_vc_ids", []):
+            vc = self.fetch_vc(vc_id)
+            if vc is not None:
+                vcs.append(vc)
+        last_interaction = None
+        if data["last_interaction"] is not None:
+            last_interaction = datetime.fromisoformat(data["last_interaction"])
+        return TrustEntry(
+            did=did,
+            reputation_alpha=data["reputation_alpha"],
+            reputation_beta=data["reputation_beta"],
+            audit_vcs=tuple(vcs),
+            behavioral_score=data["behavioral_score"],
+            total_interactions=data["total_interactions"],
+            successful_interactions=data["successful_interactions"],
+            last_interaction=last_interaction,
+            flags=frozenset(data["flags"]),
+        )
+
+    def _serialize_vc(self, vc: AuditVC) -> bytes:
+        """Serialize AuditVC to CBOR using the canonical wire format."""
+        return _encode_vc_with_proof(vc)
+
+    def _deserialize_vc(self, raw: bytes) -> AuditVC:
+        """Deserialize AuditVC from CBOR."""
+        return AuditVC.from_cbor(raw)
+
+    # -- entry operations -----------------------------------------------------
+
+    def store_entry(self, did_string: str, entry: TrustEntry) -> None:
+        data = self._serialize_entry(entry)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO trust_entries (did, entry_cbor) VALUES (?, ?)",
+                (did_string, data),
+            )
+            self._conn.commit()
+
+    def fetch_entry(self, did_string: str) -> TrustEntry | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT entry_cbor FROM trust_entries WHERE did = ?",
+                (did_string,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._deserialize_entry(row[0])
+
+    def remove_entry(self, did_string: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM trust_entries WHERE did = ?", (did_string,)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def all_entries(self) -> list[TrustEntry]:
+        with self._lock:
+            rows = self._conn.execute("SELECT entry_cbor FROM trust_entries").fetchall()
+        return [self._deserialize_entry(row[0]) for row in rows]
+
+    def contains(self, did_string: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM trust_entries WHERE did = ?", (did_string,)
+            ).fetchone()
+            return row is not None
+
+    def count(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM trust_entries").fetchone()
+            return row[0]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM trust_entries")
+            self._conn.execute("DELETE FROM audit_vcs")
+            self._conn.commit()
+
+    # -- VC operations --------------------------------------------------------
+
+    def store_vc(self, vc_id: str, vc: AuditVC) -> None:
+        data = self._serialize_vc(vc)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO audit_vcs (vc_id, vc_cbor) VALUES (?, ?)",
+                (vc_id, data),
+            )
+            self._conn.commit()
+
+    def fetch_vc(self, vc_id: str) -> AuditVC | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT vc_cbor FROM audit_vcs WHERE vc_id = ?", (vc_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return self._deserialize_vc(row[0])
+
+    def remove_vc(self, vc_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM audit_vcs WHERE vc_id = ?", (vc_id,))
+            self._conn.commit()
+
+    def close(self) -> None:
+        """Close the SQLite connection."""
+        self._conn.close()
+
+
+# =============================================================================
+# Trust Registry
+# =============================================================================
+
+
 class TrustRegistry:
     """Thread-safe registry for agent trust information.
 
-    Provides a simple in-memory registry for tracking trust entries.
-    All operations are protected by a reentrant lock for thread safety.
+    Supports pluggable storage backends via the ``RegistryBackend`` protocol.
+    Defaults to ``InMemoryRegistryBackend`` when no backend is supplied.
+
+    The registry-level ``RLock`` ensures atomic read-modify-write sequences,
+    while the backend's own lock protects individual storage operations.
     """
 
-    def __init__(self) -> None:
-        """Initialize an empty registry."""
+    def __init__(self, backend: RegistryBackend | None = None) -> None:
+        """Initialize the registry with the given backend.
+
+        Args:
+            backend: Storage backend. Defaults to ``InMemoryRegistryBackend()``.
+        """
         self._lock = threading.RLock()
-        self._entries: dict[str, TrustEntry] = {}
-        self._vcs: dict[str, AuditVC] = {}  # VC ID -> VC lookup
+        self._backend: RegistryBackend = backend if backend is not None else InMemoryRegistryBackend()
 
     def register(self, did: DID) -> TrustEntry:
         """Register a new agent in the registry.
@@ -129,11 +387,11 @@ class TrustRegistry:
         """
         did_string = str(did)
         with self._lock:
-            if did_string in self._entries:
+            if self._backend.contains(did_string):
                 raise DuplicateEntryError(f"Entry already exists for DID: {did_string}")
 
             entry = TrustEntry(did=did)
-            self._entries[did_string] = entry
+            self._backend.store_entry(did_string, entry)
             return entry
 
     def lookup(self, did: DID | str) -> TrustEntry | None:
@@ -147,7 +405,7 @@ class TrustRegistry:
         """
         did_string = str(did) if isinstance(did, DID) else did
         with self._lock:
-            return self._entries.get(did_string)
+            return self._backend.fetch_entry(did_string)
 
     def get(self, did: DID | str) -> TrustEntry:
         """Get an agent's trust entry, raising if not found.
@@ -206,7 +464,7 @@ class TrustRegistry:
                 flags=entry.flags,
             )
 
-            self._entries[did_string] = updated_entry
+            self._backend.store_entry(did_string, updated_entry)
             return updated_entry
 
     def add_audit_vc(self, did: DID | str, vc: AuditVC) -> TrustEntry:
@@ -235,7 +493,7 @@ class TrustRegistry:
                 )
 
             # Add VC to lookup table
-            self._vcs[vc.id] = vc
+            self._backend.store_vc(vc.id, vc)
 
             # Create updated entry with new VC
             updated_entry = TrustEntry(
@@ -250,7 +508,7 @@ class TrustRegistry:
                 flags=entry.flags,
             )
 
-            self._entries[did_string] = updated_entry
+            self._backend.store_entry(did_string, updated_entry)
             return updated_entry
 
     def add_flag(self, did: DID | str, flag: str) -> TrustEntry:
@@ -283,7 +541,7 @@ class TrustRegistry:
                 flags=entry.flags | frozenset([flag]),
             )
 
-            self._entries[did_string] = updated_entry
+            self._backend.store_entry(did_string, updated_entry)
             return updated_entry
 
     def update_behavioral_score(self, did: DID | str, new_score: float) -> TrustEntry:
@@ -318,7 +576,7 @@ class TrustRegistry:
                 flags=entry.flags,
             )
 
-            self._entries[did_string] = updated_entry
+            self._backend.store_entry(did_string, updated_entry)
             return updated_entry
 
     def remove_flag(self, did: DID | str, flag: str) -> TrustEntry:
@@ -351,7 +609,7 @@ class TrustRegistry:
                 flags=entry.flags - frozenset([flag]),
             )
 
-            self._entries[did_string] = updated_entry
+            self._backend.store_entry(did_string, updated_entry)
             return updated_entry
 
     def lookup_vc(self, vc_id: str) -> AuditVC | None:
@@ -364,7 +622,7 @@ class TrustRegistry:
             The AuditVC, or None if not found.
         """
         with self._lock:
-            return self._vcs.get(vc_id)
+            return self._backend.fetch_vc(vc_id)
 
     def remove(self, did: DID | str) -> bool:
         """Remove an entry and its associated VCs.
@@ -377,23 +635,22 @@ class TrustRegistry:
         """
         did_string = str(did) if isinstance(did, DID) else did
         with self._lock:
-            entry = self._entries.get(did_string)
+            entry = self._backend.fetch_entry(did_string)
             if entry is None:
                 return False
 
             # Remove associated VCs
             for vc in entry.audit_vcs:
-                self._vcs.pop(vc.id, None)
+                self._backend.remove_vc(vc.id)
 
             # Remove entry
-            del self._entries[did_string]
+            self._backend.remove_entry(did_string)
             return True
 
     def clear(self) -> None:
         """Remove all entries and VCs from the registry."""
         with self._lock:
-            self._entries.clear()
-            self._vcs.clear()
+            self._backend.clear()
 
     def all_entries(self) -> list[TrustEntry]:
         """Return a snapshot list of all entries.
@@ -402,18 +659,18 @@ class TrustRegistry:
             A list of all trust entries.
         """
         with self._lock:
-            return list(self._entries.values())
+            return self._backend.all_entries()
 
     def __contains__(self, did: DID | str) -> bool:
         """Check if a DID is registered."""
         did_string = str(did) if isinstance(did, DID) else did
         with self._lock:
-            return did_string in self._entries
+            return self._backend.contains(did_string)
 
     def __len__(self) -> int:
         """Return the number of registered entries."""
         with self._lock:
-            return len(self._entries)
+            return self._backend.count()
 
 
 # Module-level singleton registry

@@ -10,14 +10,17 @@ This module provides wrappers for NIST-standardized post-quantum algorithms:
 
 __all__ = [
     "aead",
+    "bulletproofs",
     "certificates",
     "dilithium",
+    "ec",
     "ed25519",
     "exceptions",
     "hybrid",
     "kdf",
     "kem",
     "merkle",
+    "pedersen",
     "shamir",
     "signatures",
     "suites",

@@ -18,13 +18,21 @@ from qasp.crypto import aead, kem
 from qasp.crypto.signatures import sign, verify
 
 __all__ = [
+    "POE_FAILURE",
+    "POE_SUCCESS",
+    "POE_VIOLATION",
+    "PoEChain",
+    "PoEChainError",
     "PrivacyError",
+    "ProofOfExecution",
     "TraceDecryptionError",
     "TraceEntry",
     "TraceVerificationError",
     "create_private_trace_entry",
+    "create_proof_of_execution",
     "decrypt_auditor_envelope",
     "verify_args_hash",
+    "verify_proof_of_execution",
     "verify_trace_entry",
 ]
 
@@ -254,3 +262,252 @@ def verify_args_hash(entry: TraceEntry, original_args: bytes) -> bool:
         True if the hash matches.
     """
     return hashlib.sha384(original_args).digest() == entry.args_hash
+
+
+# =============================================================================
+# Proof of Execution (Section 10.5.5)
+# =============================================================================
+
+POE_SUCCESS = "success"
+POE_FAILURE = "failure"
+POE_VIOLATION = "violation"
+
+
+class PoEChainError(PrivacyError):
+    """Raised when PoE chain validation fails."""
+
+
+@dataclass(frozen=True)
+class ProofOfExecution:
+    """A signed proof of execution with hash-chain linkage.
+
+    Fields:
+        agent_did: The executing agent's DID.
+        action: The action performed.
+        resource: The resource URI.
+        token_id: Capability token identifier.
+        timestamp: Unix timestamp of execution.
+        result: Execution result (POE_SUCCESS, POE_FAILURE, POE_VIOLATION).
+        args_hash: SHA-384 digest of the arguments.
+        prev_poe_hash: SHA-384 hash of the previous PoE in the chain (empty for first).
+        signature: ML-DSA-65 signature over all other fields.
+    """
+
+    agent_did: str
+    action: str
+    resource: str
+    token_id: bytes
+    timestamp: int
+    result: str
+    args_hash: bytes
+    prev_poe_hash: bytes
+    signature: bytes
+
+    def signable_bytes(self) -> bytes:
+        """Return CBOR-encoded bytes for signing (excludes signature)."""
+        return cbor2.dumps({
+            "agent_did": self.agent_did,
+            "action": self.action,
+            "resource": self.resource,
+            "token_id": self.token_id,
+            "timestamp": self.timestamp,
+            "result": self.result,
+            "args_hash": self.args_hash,
+            "prev_poe_hash": self.prev_poe_hash,
+        })
+
+    def compute_hash(self) -> bytes:
+        """Compute SHA-384 hash of the full PoE (including signature)."""
+        return hashlib.sha384(self.to_cbor()).digest()
+
+    def to_cbor(self) -> bytes:
+        """Serialize the full PoE to CBOR."""
+        return cbor2.dumps({
+            "agent_did": self.agent_did,
+            "action": self.action,
+            "resource": self.resource,
+            "token_id": self.token_id,
+            "timestamp": self.timestamp,
+            "result": self.result,
+            "args_hash": self.args_hash,
+            "prev_poe_hash": self.prev_poe_hash,
+            "signature": self.signature,
+        })
+
+    @classmethod
+    def from_cbor(cls, data: bytes) -> ProofOfExecution:
+        """Deserialize a PoE from CBOR."""
+        d = cbor2.loads(data)
+        return cls(
+            agent_did=d["agent_did"],
+            action=d["action"],
+            resource=d["resource"],
+            token_id=bytes(d["token_id"]),
+            timestamp=d["timestamp"],
+            result=d["result"],
+            args_hash=bytes(d["args_hash"]),
+            prev_poe_hash=bytes(d["prev_poe_hash"]),
+            signature=bytes(d["signature"]),
+        )
+
+
+def create_proof_of_execution(
+    agent_did: str,
+    action: str,
+    resource: str,
+    token_id: bytes,
+    result: str,
+    arguments: bytes,
+    signer_sk: bytes,
+    prev_poe_hash: bytes = b"",
+    timestamp: int | None = None,
+) -> ProofOfExecution:
+    """Create a signed Proof of Execution.
+
+    Args:
+        agent_did: The executing agent's DID.
+        action: The action performed.
+        resource: The resource URI.
+        token_id: Capability token identifier.
+        result: Execution result string.
+        arguments: Raw argument bytes (will be hashed).
+        signer_sk: Signer's ML-DSA-65 secret key.
+        prev_poe_hash: Hash of previous PoE in chain (empty for first).
+        timestamp: Unix timestamp (defaults to current time).
+
+    Returns:
+        A signed ProofOfExecution.
+    """
+    if timestamp is None:
+        timestamp = int(time.time())
+
+    args_hash = hashlib.sha384(arguments).digest()
+
+    unsigned = ProofOfExecution(
+        agent_did=agent_did,
+        action=action,
+        resource=resource,
+        token_id=token_id,
+        timestamp=timestamp,
+        result=result,
+        args_hash=args_hash,
+        prev_poe_hash=prev_poe_hash,
+        signature=b"",
+    )
+    signature = sign(signer_sk, unsigned.signable_bytes())
+
+    return ProofOfExecution(
+        agent_did=agent_did,
+        action=action,
+        resource=resource,
+        token_id=token_id,
+        timestamp=timestamp,
+        result=result,
+        args_hash=args_hash,
+        prev_poe_hash=prev_poe_hash,
+        signature=signature,
+    )
+
+
+def verify_proof_of_execution(poe: ProofOfExecution, signer_pk: bytes) -> bool:
+    """Verify a Proof of Execution's ML-DSA-65 signature.
+
+    Args:
+        poe: The proof to verify.
+        signer_pk: The signer's public key.
+
+    Returns:
+        True if valid.
+
+    Raises:
+        TraceVerificationError: If signature verification fails.
+    """
+    try:
+        return verify(signer_pk, poe.signable_bytes(), poe.signature)
+    except Exception as e:
+        raise TraceVerificationError(
+            f"PoE signature verification failed: {e}"
+        ) from e
+
+
+class PoEChain:
+    """An ordered, hash-chained list of Proofs of Execution."""
+
+    def __init__(self) -> None:
+        self._entries: list[ProofOfExecution] = []
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    @property
+    def entries(self) -> list[ProofOfExecution]:
+        return list(self._entries)
+
+    @property
+    def latest_hash(self) -> bytes:
+        """Hash of the most recent entry, or empty bytes if chain is empty."""
+        if not self._entries:
+            return b""
+        return self._entries[-1].compute_hash()
+
+    def append(self, poe: ProofOfExecution) -> None:
+        """Append a PoE, validating hash chain continuity.
+
+        Args:
+            poe: The proof to append.
+
+        Raises:
+            PoEChainError: If the prev_poe_hash doesn't match.
+        """
+        if self._entries:
+            expected = self._entries[-1].compute_hash()
+            if poe.prev_poe_hash != expected:
+                raise PoEChainError(
+                    "Hash chain broken: prev_poe_hash mismatch"
+                )
+        else:
+            if poe.prev_poe_hash != b"":
+                raise PoEChainError(
+                    "First entry must have empty prev_poe_hash"
+                )
+        self._entries.append(poe)
+
+    def verify(self, signer_pk: bytes) -> bool:
+        """Verify the full chain: all signatures and hash linkage.
+
+        Args:
+            signer_pk: The signer's public key.
+
+        Returns:
+            True if the entire chain is valid.
+
+        Raises:
+            PoEChainError: If chain validation fails.
+            TraceVerificationError: If a signature fails.
+        """
+        for i, poe in enumerate(self._entries):
+            if i == 0:
+                if poe.prev_poe_hash != b"":
+                    raise PoEChainError("First entry must have empty prev_poe_hash")
+            else:
+                expected = self._entries[i - 1].compute_hash()
+                if poe.prev_poe_hash != expected:
+                    raise PoEChainError(
+                        f"Hash chain broken at index {i}"
+                    )
+            verify_proof_of_execution(poe, signer_pk)
+        return True
+
+    def to_cbor(self) -> bytes:
+        """Serialize the full chain to CBOR."""
+        return cbor2.dumps([poe.to_cbor() for poe in self._entries])
+
+    @classmethod
+    def from_cbor(cls, data: bytes) -> PoEChain:
+        """Deserialize a chain from CBOR."""
+        chain = cls()
+        entries = cbor2.loads(data)
+        for entry_bytes in entries:
+            poe = ProofOfExecution.from_cbor(entry_bytes)
+            chain.append(poe)
+        return chain

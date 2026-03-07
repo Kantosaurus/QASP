@@ -175,6 +175,7 @@ class ServerHello(Message):
     selected_cipher_suite: int = 0
     signature: bytes = b""
     extensions: bytes = b""
+    certificate_chain: bytes = b""
 
 
 @dataclass(frozen=True)

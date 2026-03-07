@@ -2,12 +2,14 @@
 
 This module implements behavioral checks for verifying
 agent behavior patterns, including FSM-based state tracking,
-capability manifests, and anomaly detection.
+capability manifests, anomaly detection, and goal-conditioned
+drift detection (KL-divergence + Wasserstein distance).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
 
@@ -20,11 +22,13 @@ from qasp.trust.exceptions import ManifestError
 __all__ = [
     "EVENT_STATE_MAP",
     "PERMITTED_TRANSITIONS",
+    "BehaviorDistribution",
     "BehaviorEvent",
     "BehaviorState",
     "BehaviorType",
     "BehavioralVerifier",
     "CapabilityManifest",
+    "DriftDetector",
     "create_manifest",
     "is_permitted_transition",
     "verify_manifest",
@@ -346,3 +350,157 @@ class BehavioralVerifier:
 
         score = 1.0 - (violation_weight / total_weight)
         return max(0.0, min(1.0, score))
+
+    def detect_drift(self, baseline_events: list[BehaviorEvent] | None = None) -> float:
+        """Detect behavioral drift from a baseline distribution.
+
+        Uses the first half of recorded events as baseline if none provided.
+
+        Args:
+            baseline_events: Optional baseline event list. If None, uses
+                first half of recorded events.
+
+        Returns:
+            Combined drift score in [0.0, 1.0].
+        """
+        if len(self._events) < 4:
+            return 0.0
+
+        if baseline_events is not None:
+            baseline = DriftDetector.distribution_from_events(baseline_events)
+        else:
+            mid = len(self._events) // 2
+            baseline = DriftDetector.distribution_from_events(self._events[:mid])
+
+        current = DriftDetector.distribution_from_events(self._events[len(self._events) // 2 :])
+        detector = DriftDetector(baseline=baseline)
+        return detector.compute_drift_score(current)
+
+
+# =============================================================================
+# Drift Detection (Section 10.5.3)
+# =============================================================================
+
+# Canonical ordering of BehaviorType for Wasserstein distance
+_BEHAVIOR_TYPE_ORDER: list[BehaviorType] = sorted(BehaviorType, key=lambda bt: bt.value)
+
+
+@dataclass(frozen=True)
+class BehaviorDistribution:
+    """Probability distribution over BehaviorType values."""
+
+    probs: dict[BehaviorType, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Normalize if needed
+        total = sum(self.probs.values())
+        if total > 0 and abs(total - 1.0) > 1e-9:
+            normalized = {k: v / total for k, v in self.probs.items()}
+            object.__setattr__(self, "probs", normalized)
+
+
+class DriftDetector:
+    """Goal-conditioned drift detection using KL-divergence and Wasserstein distance.
+
+    Args:
+        baseline: The reference (expected) behavior distribution.
+        kl_threshold: Threshold for KL-divergence normalization (default 2.0).
+        wasserstein_threshold: Threshold for Wasserstein normalization (default 1.0).
+        kl_weight: Weight for KL component (default 0.6).
+        wasserstein_weight: Weight for Wasserstein component (default 0.4).
+    """
+
+    def __init__(
+        self,
+        baseline: BehaviorDistribution,
+        *,
+        kl_threshold: float = 2.0,
+        wasserstein_threshold: float = 1.0,
+        kl_weight: float = 0.6,
+        wasserstein_weight: float = 0.4,
+    ) -> None:
+        self._baseline = baseline
+        self._kl_threshold = kl_threshold
+        self._wasserstein_threshold = wasserstein_threshold
+        self._kl_weight = kl_weight
+        self._wasserstein_weight = wasserstein_weight
+
+    @staticmethod
+    def kl_divergence(p: BehaviorDistribution, q: BehaviorDistribution) -> float:
+        """Compute KL(P || Q) with Laplace smoothing.
+
+        Args:
+            p: The observed distribution.
+            q: The reference distribution.
+
+        Returns:
+            Non-negative KL divergence value.
+        """
+        epsilon = 1e-10
+        types = _BEHAVIOR_TYPE_ORDER
+        result = 0.0
+        for bt in types:
+            p_val = p.probs.get(bt, 0.0) + epsilon
+            q_val = q.probs.get(bt, 0.0) + epsilon
+            result += p_val * math.log(p_val / q_val)
+        return max(0.0, result)
+
+    @staticmethod
+    def wasserstein_distance(
+        p: BehaviorDistribution, q: BehaviorDistribution,
+    ) -> float:
+        """Compute Wasserstein-1 (earth mover's) distance over BehaviorType ordering.
+
+        Args:
+            p: First distribution.
+            q: Second distribution.
+
+        Returns:
+            Non-negative Wasserstein-1 distance.
+        """
+        types = _BEHAVIOR_TYPE_ORDER
+        cdf_diff = 0.0
+        p_cum = 0.0
+        q_cum = 0.0
+        result = 0.0
+        for bt in types:
+            p_cum += p.probs.get(bt, 0.0)
+            q_cum += q.probs.get(bt, 0.0)
+            result += abs(p_cum - q_cum)
+        return result
+
+    def compute_drift_score(self, current: BehaviorDistribution) -> float:
+        """Compute combined drift score from baseline.
+
+        Args:
+            current: The current observed behavior distribution.
+
+        Returns:
+            Drift score in [0.0, 1.0]. 0 means no drift, 1 means maximum drift.
+        """
+        kl = self.kl_divergence(current, self._baseline)
+        w = self.wasserstein_distance(current, self._baseline)
+
+        kl_norm = min(1.0, kl / self._kl_threshold) if self._kl_threshold > 0 else 0.0
+        w_norm = min(1.0, w / self._wasserstein_threshold) if self._wasserstein_threshold > 0 else 0.0
+
+        score = self._kl_weight * kl_norm + self._wasserstein_weight * w_norm
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def distribution_from_events(events: list[BehaviorEvent]) -> BehaviorDistribution:
+        """Build a BehaviorDistribution from a list of events.
+
+        Args:
+            events: List of behavior events.
+
+        Returns:
+            Normalized probability distribution.
+        """
+        if not events:
+            return BehaviorDistribution()
+        counts: dict[BehaviorType, float] = {}
+        for e in events:
+            counts[e.event_type] = counts.get(e.event_type, 0.0) + 1.0
+        total = len(events)
+        return BehaviorDistribution(probs={k: v / total for k, v in counts.items()})

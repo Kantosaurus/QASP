@@ -8,6 +8,14 @@ import pytest
 
 from qasp.identity import DID, DIDRegistry
 from qasp.protocol.capability import (
+    ARM_ATTENUATE,
+    ARM_CHARGE,
+    ARM_DELEGATE,
+    ARM_EXEC,
+    ARM_READ,
+    ARM_REVOKE,
+    ARM_VERBS,
+    ARM_WRITE,
     AttenuationError,
     AuthorityChainEntry,
     CapabilityToken,
@@ -33,6 +41,41 @@ from qasp.protocol.capability import (
     verify_multi_owner_token,
     verify_token,
 )
+
+# =============================================================================
+# ARM Verb Constants Tests
+# =============================================================================
+
+
+class TestARMVerbConstants:
+    """Tests for canonical ARM verb constants."""
+
+    def test_all_seven_constants_are_strings(self) -> None:
+        for verb in [ARM_READ, ARM_WRITE, ARM_EXEC, ARM_DELEGATE,
+                     ARM_CHARGE, ARM_ATTENUATE, ARM_REVOKE]:
+            assert isinstance(verb, str)
+
+    def test_arm_verbs_has_seven_members(self) -> None:
+        assert len(ARM_VERBS) == 7
+
+    def test_arm_verbs_is_frozenset(self) -> None:
+        assert isinstance(ARM_VERBS, frozenset)
+
+    def test_arm_verbs_contains_all_constants(self) -> None:
+        assert ARM_READ in ARM_VERBS
+        assert ARM_WRITE in ARM_VERBS
+        assert ARM_EXEC in ARM_VERBS
+        assert ARM_DELEGATE in ARM_VERBS
+        assert ARM_CHARGE in ARM_VERBS
+        assert ARM_ATTENUATE in ARM_VERBS
+        assert ARM_REVOKE in ARM_VERBS
+
+    def test_verbset_from_arm_verbs(self) -> None:
+        """ARM_VERBS can be used to create a VerbSet."""
+        vs = VerbSet(ARM_VERBS)
+        assert len(vs) == 7
+        assert ARM_READ in vs
+
 
 # =============================================================================
 # VerbSet Tests

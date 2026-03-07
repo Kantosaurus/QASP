@@ -31,9 +31,11 @@ if TYPE_CHECKING:
 __all__ = [
     "Certificate",
     "CertificateError",
+    "create_issued_certificate",
     "create_self_signed",
     "parse_certificate",
     "verify_certificate",
+    "verify_certificate_chain",
 ]
 
 # ML-DSA-65 OID: 2.16.840.1.101.3.4.3.18 (NIST CSOR)
@@ -54,6 +56,16 @@ DER_UTC_TIME = 0x17
 DER_GENERALIZED_TIME = 0x18
 DER_CONTEXT_0 = 0xA0
 DER_CONTEXT_3 = 0xA3
+
+# QASP Private OID arc: 1.3.6.1.4.1.59999
+# Sub-OIDs for QASP extensions:
+#   .1 = permitted capability classes
+#   .2 = max delegation depth
+#   .3 = spending limit
+QASP_OID_ARC = "1.3.6.1.4.1.59999"
+QASP_CAPABILITY_CLASSES_OID = bytes([0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xD4, 0x5F, 0x01])
+QASP_MAX_DELEGATION_OID = bytes([0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xD4, 0x5F, 0x02])
+QASP_SPENDING_LIMIT_OID = bytes([0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xD4, 0x5F, 0x03])
 
 
 class CertificateError(Exception):
@@ -195,6 +207,9 @@ def _encode_extensions(
     key_usage: frozenset[str],
     subject_alt_names: tuple[str, ...],
     is_ca: bool,
+    permitted_capability_classes: tuple[str, ...] = (),
+    max_delegation_depth: int | None = None,
+    spending_limit: int | None = None,
 ) -> bytes:
     """Encode X.509v3 extensions."""
     extensions_content = b""
@@ -264,6 +279,32 @@ def _encode_extensions(
         )
         extensions_content += san_ext
 
+    # QASP extension: Permitted capability classes
+    if permitted_capability_classes:
+        cap_value = _encode_sequence(
+            b"".join(_encode_utf8_string(c) for c in permitted_capability_classes)
+        )
+        cap_ext = _encode_sequence(
+            _encode_oid(QASP_CAPABILITY_CLASSES_OID) + _encode_octet_string(cap_value)
+        )
+        extensions_content += cap_ext
+
+    # QASP extension: Max delegation depth
+    if max_delegation_depth is not None:
+        depth_value = _encode_integer(max_delegation_depth)
+        depth_ext = _encode_sequence(
+            _encode_oid(QASP_MAX_DELEGATION_OID) + _encode_octet_string(depth_value)
+        )
+        extensions_content += depth_ext
+
+    # QASP extension: Spending limit
+    if spending_limit is not None:
+        limit_value = _encode_integer(spending_limit)
+        limit_ext = _encode_sequence(
+            _encode_oid(QASP_SPENDING_LIMIT_OID) + _encode_octet_string(limit_value)
+        )
+        extensions_content += limit_ext
+
     return _encode_explicit(DER_CONTEXT_3, _encode_sequence(extensions_content))
 
 
@@ -278,6 +319,9 @@ def _build_tbs_certificate(
     extended_key_usage: frozenset[str],  # noqa: ARG001 - reserved for future use
     subject_alt_names: tuple[str, ...],
     is_ca: bool,
+    permitted_capability_classes: tuple[str, ...] = (),
+    max_delegation_depth: int | None = None,
+    spending_limit: int | None = None,
 ) -> bytes:
     """Build the TBSCertificate structure.
 
@@ -317,7 +361,12 @@ def _build_tbs_certificate(
     content += _encode_subject_public_key_info(public_key)
 
     # Extensions (v3)
-    content += _encode_extensions(key_usage, subject_alt_names, is_ca)
+    content += _encode_extensions(
+        key_usage, subject_alt_names, is_ca,
+        permitted_capability_classes=permitted_capability_classes,
+        max_delegation_depth=max_delegation_depth,
+        spending_limit=spending_limit,
+    )
 
     return _encode_sequence(content)
 
@@ -353,6 +402,10 @@ class Certificate:
     key_usage: frozenset[str] = field(default_factory=frozenset)
     extended_key_usage: frozenset[str] = field(default_factory=frozenset)
     subject_alt_names: tuple[str, ...] = field(default_factory=tuple)
+    permitted_capability_classes: tuple[str, ...] = ()
+    max_delegation_depth: int | None = None
+    spending_limit: int | None = None
+    is_ca: bool = False
 
     def is_valid(self, now: datetime | None = None) -> bool:
         """Check if the certificate is currently valid.
@@ -413,6 +466,9 @@ def create_self_signed(
     extended_key_usage: frozenset[str] | None = None,
     subject_alt_names: tuple[str, ...] | None = None,
     is_ca: bool = False,
+    permitted_capability_classes: tuple[str, ...] | None = None,
+    max_delegation_depth: int | None = None,
+    spending_limit: int | None = None,
 ) -> Certificate:
     """Create a self-signed X.509-PQ certificate.
 
@@ -424,6 +480,9 @@ def create_self_signed(
         extended_key_usage: Extended key usage OIDs.
         subject_alt_names: Subject alternative names (e.g., DIDs).
         is_ca: Whether this is a CA certificate.
+        permitted_capability_classes: Allowed capability classes for issued certs.
+        max_delegation_depth: Maximum delegation depth for issued certs.
+        spending_limit: Maximum spending limit for issued certs.
 
     Returns:
         A self-signed Certificate.
@@ -454,6 +513,8 @@ def create_self_signed(
         extended_key_usage = frozenset()
     if subject_alt_names is None:
         subject_alt_names = ()
+    if permitted_capability_classes is None:
+        permitted_capability_classes = ()
 
     # Build TBS certificate
     tbs_certificate = _build_tbs_certificate(
@@ -467,6 +528,9 @@ def create_self_signed(
         extended_key_usage=extended_key_usage,
         subject_alt_names=subject_alt_names,
         is_ca=is_ca,
+        permitted_capability_classes=permitted_capability_classes,
+        max_delegation_depth=max_delegation_depth,
+        spending_limit=spending_limit,
     )
 
     # Sign with ML-DSA-65
@@ -492,6 +556,155 @@ def create_self_signed(
         key_usage=key_usage,
         extended_key_usage=extended_key_usage,
         subject_alt_names=subject_alt_names,
+        permitted_capability_classes=permitted_capability_classes,
+        max_delegation_depth=max_delegation_depth,
+        spending_limit=spending_limit,
+        is_ca=is_ca,
+    )
+
+
+def create_issued_certificate(
+    subject: str,
+    subject_keypair: tuple[bytes, bytes],
+    issuer_cert: Certificate,
+    issuer_secret_key: bytes,
+    validity_days: int = 365,
+    key_usage: frozenset[str] | None = None,
+    extended_key_usage: frozenset[str] | None = None,
+    subject_alt_names: tuple[str, ...] | None = None,
+    is_ca: bool = False,
+    permitted_capability_classes: tuple[str, ...] | None = None,
+    max_delegation_depth: int | None = None,
+    spending_limit: int | None = None,
+) -> Certificate:
+    """Create a certificate issued by an existing CA certificate.
+
+    Args:
+        subject: The certificate subject (CN).
+        subject_keypair: Tuple of (public_key, secret_key) for the subject.
+        issuer_cert: The issuing CA certificate.
+        issuer_secret_key: The issuer's secret key for signing.
+        validity_days: Certificate validity period in days.
+        key_usage: Key usage flags.
+        extended_key_usage: Extended key usage OIDs.
+        subject_alt_names: Subject alternative names.
+        is_ca: Whether the issued certificate is a CA.
+        permitted_capability_classes: Allowed capability classes.
+        max_delegation_depth: Maximum delegation depth.
+        spending_limit: Maximum spending limit.
+
+    Returns:
+        A Certificate signed by the issuer.
+
+    Raises:
+        InvalidKeyError: If the keypair is invalid.
+        CertificateError: If certificate creation fails or constraints are violated.
+    """
+    # Issuer must be a CA
+    if not issuer_cert.is_ca:
+        raise CertificateError("Issuer certificate is not a CA")
+
+    public_key, _ = subject_keypair
+
+    if len(public_key) != ML_DSA_65_PUBLIC_KEY_SIZE:
+        raise InvalidKeyError(
+            f"Invalid public key size: expected {ML_DSA_65_PUBLIC_KEY_SIZE}, "
+            f"got {len(public_key)}"
+        )
+
+    # Enforce delegation depth constraint
+    if issuer_cert.max_delegation_depth is not None:
+        if issuer_cert.max_delegation_depth <= 0:
+            raise CertificateError(
+                "Issuer has no remaining delegation depth"
+            )
+        # Auto-decrement delegation depth
+        if max_delegation_depth is None:
+            max_delegation_depth = issuer_cert.max_delegation_depth - 1
+        elif max_delegation_depth >= issuer_cert.max_delegation_depth:
+            raise CertificateError(
+                f"Issued cert delegation depth ({max_delegation_depth}) must be "
+                f"less than issuer's ({issuer_cert.max_delegation_depth})"
+            )
+
+    # Enforce capability class constraint
+    if permitted_capability_classes is None:
+        permitted_capability_classes = ()
+    if issuer_cert.permitted_capability_classes:
+        issuer_classes = set(issuer_cert.permitted_capability_classes)
+        issued_classes = set(permitted_capability_classes)
+        if issued_classes and not issued_classes.issubset(issuer_classes):
+            raise CertificateError(
+                f"Issued cert capability classes {issued_classes} are not a "
+                f"subset of issuer's {issuer_classes}"
+            )
+
+    # Enforce spending limit constraint
+    if issuer_cert.spending_limit is not None:
+        if spending_limit is not None and spending_limit > issuer_cert.spending_limit:
+            raise CertificateError(
+                f"Issued cert spending limit ({spending_limit}) exceeds "
+                f"issuer's ({issuer_cert.spending_limit})"
+            )
+
+    # Generate serial number
+    serial_number = int.from_bytes(os.urandom(16), "big") >> 1
+
+    # Set validity period
+    not_before = datetime.now(UTC).replace(microsecond=0)
+    not_after = not_before + timedelta(days=validity_days)
+
+    # Defaults
+    if key_usage is None:
+        key_usage = frozenset({"digitalSignature"})
+    if extended_key_usage is None:
+        extended_key_usage = frozenset()
+    if subject_alt_names is None:
+        subject_alt_names = ()
+
+    # Build TBS certificate with issuer's subject as the issuer field
+    tbs_certificate = _build_tbs_certificate(
+        serial_number=serial_number,
+        issuer=issuer_cert.subject,
+        subject=subject,
+        public_key=public_key,
+        not_before=not_before,
+        not_after=not_after,
+        key_usage=key_usage,
+        extended_key_usage=extended_key_usage,
+        subject_alt_names=subject_alt_names,
+        is_ca=is_ca,
+        permitted_capability_classes=permitted_capability_classes,
+        max_delegation_depth=max_delegation_depth,
+        spending_limit=spending_limit,
+    )
+
+    # Sign with issuer's key
+    signature = sign(issuer_secret_key, tbs_certificate)
+
+    # Build complete certificate
+    certificate_content = (
+        tbs_certificate + _encode_algorithm_identifier() + _encode_bit_string(signature)
+    )
+    raw = _encode_sequence(certificate_content)
+
+    return Certificate(
+        subject=subject,
+        issuer=issuer_cert.subject,
+        public_key=public_key,
+        signature_algorithm=ML_DSA_65_OID,
+        signature=signature,
+        not_before=not_before,
+        not_after=not_after,
+        serial_number=serial_number,
+        raw=raw,
+        key_usage=key_usage,
+        extended_key_usage=extended_key_usage,
+        subject_alt_names=subject_alt_names,
+        permitted_capability_classes=permitted_capability_classes,
+        max_delegation_depth=max_delegation_depth,
+        spending_limit=spending_limit,
+        is_ca=is_ca,
     )
 
 
@@ -559,6 +772,118 @@ def verify_certificate(
 
     # Verify signature
     return verify(issuer_public_key, tbs_certificate, certificate.signature)
+
+
+def verify_certificate_chain(
+    chain: list[Certificate],
+    trusted_roots: list[Certificate] | None = None,
+    check_validity: bool = True,
+) -> bool:
+    """Verify a certificate chain from root to leaf.
+
+    The chain is ordered root-to-leaf. Each certificate's signature is
+    verified using the parent certificate's public key. Intermediate
+    certificates must have ``is_ca=True``.
+
+    Args:
+        chain: Ordered list of certificates [root, ..., leaf].
+        trusted_roots: Optional list of trusted root certificates.
+            If provided, the chain's root must match one of these.
+        check_validity: Whether to check temporal validity of each cert.
+
+    Returns:
+        True if the entire chain is valid.
+
+    Raises:
+        CertificateError: If any chain constraint is violated.
+    """
+    if not chain:
+        raise CertificateError("Empty certificate chain")
+
+    if len(chain) < 2:
+        raise CertificateError("Certificate chain must have at least 2 certificates")
+
+    root = chain[0]
+
+    # Check trusted roots
+    if trusted_roots is not None:
+        root_trusted = any(
+            tr.public_key == root.public_key and tr.subject == root.subject
+            for tr in trusted_roots
+        )
+        if not root_trusted:
+            raise CertificateError("Root certificate is not in trusted roots")
+
+    # Verify root is self-signed and valid
+    if not root.is_self_signed():
+        raise CertificateError("Root certificate must be self-signed")
+
+    try:
+        verify_certificate(root)
+    except Exception as e:
+        raise CertificateError(f"Root certificate signature invalid: {e}") from e
+
+    if check_validity and not root.is_valid():
+        raise CertificateError("Root certificate is not valid (expired or not yet valid)")
+
+    if not root.is_ca:
+        raise CertificateError("Root certificate is not a CA")
+
+    # Walk the chain verifying each link
+    for i in range(1, len(chain)):
+        parent = chain[i - 1]
+        child = chain[i]
+
+        # Verify child's signature with parent's public key
+        try:
+            verify_certificate(child, issuer_public_key=parent.public_key)
+        except Exception as e:
+            raise CertificateError(
+                f"Certificate {i} ({child.subject}) signature verification "
+                f"failed against parent ({parent.subject}): {e}"
+            ) from e
+
+        # Check temporal validity
+        if check_validity and not child.is_valid():
+            raise CertificateError(
+                f"Certificate {i} ({child.subject}) is not valid "
+                f"(expired or not yet valid)"
+            )
+
+        # Intermediates (not the leaf) must be CAs
+        is_intermediate = i < len(chain) - 1
+        if is_intermediate and not child.is_ca:
+            raise CertificateError(
+                f"Intermediate certificate {i} ({child.subject}) is not a CA"
+            )
+
+        # Verify QASP constraint narrowing
+        if parent.permitted_capability_classes and child.permitted_capability_classes:
+            parent_classes = set(parent.permitted_capability_classes)
+            child_classes = set(child.permitted_capability_classes)
+            if not child_classes.issubset(parent_classes):
+                raise CertificateError(
+                    f"Certificate {i} ({child.subject}) capability classes "
+                    f"{child_classes} are not a subset of parent's {parent_classes}"
+                )
+
+        if parent.max_delegation_depth is not None and child.max_delegation_depth is not None:
+            if child.max_delegation_depth >= parent.max_delegation_depth:
+                raise CertificateError(
+                    f"Certificate {i} ({child.subject}) delegation depth "
+                    f"({child.max_delegation_depth}) must be less than "
+                    f"parent's ({parent.max_delegation_depth})"
+                )
+
+        if parent.spending_limit is not None and child.spending_limit is not None:
+            if child.spending_limit > parent.spending_limit:
+                raise CertificateError(
+                    f"Certificate {i} ({child.subject}) spending limit "
+                    f"({child.spending_limit}) exceeds parent's "
+                    f"({parent.spending_limit})"
+                )
+
+    return True
 
 
 def _parse_length(data: bytes, offset: int) -> tuple[int, int]:

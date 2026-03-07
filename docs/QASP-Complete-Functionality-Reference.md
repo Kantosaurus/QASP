@@ -74,30 +74,38 @@ The HMAC-SHA-384 integrity tag is computed over the header and payload using the
 
 ## 1.5. Message Types
 
-QASP defines 20 message types:
+QASP defines 28 message types (as implemented in `framing/messages.py`):
 
 | ID | Message | Direction | Purpose |
 |----|---------|-----------|---------|
-| 0x01 | ResourceRequest | Agent → Server | Request access to a resource |
-| 0x02 | ResourceGrant | Server → Agent | Approve resource access with token |
-| 0x03 | ResourceDeny | Server → Agent | Reject resource request |
-| 0x04 | ResourceRelease | Agent → Server | Release resource when done |
+| 0x01 | ClientHello | Initiator → Responder | Begin handshake |
+| 0x02 | ServerHello | Responder → Initiator | Handshake response |
+| 0x03 | ClientAuth | Initiator → Responder | Complete handshake |
+| 0x04 | ApplicationData | Any → Any | Encrypted application data |
 | 0x05 | TokenRevocation | Owner/Server → All | Revoke a capability token |
 | 0x06 | RevocationNotice | Any → Any | Notify of cascading revocation |
-| 0x07 | DelegationRequest | Agent₁ → Agent₂ | Request delegation of capabilities |
-| 0x08 | DelegationGrant | Agent₂ → Agent₁ | Approve delegation |
-| 0x09 | MeterReport | Server → Agent | Report resource consumption |
-| 0x0A | MeterAck | Agent → Server | Acknowledge metering report |
-| 0x0B | CapabilityQuery | Agent → Server | Query available capabilities |
-| 0x0C | CapabilityAdvertise | Server → Agent | Advertise available capabilities |
+| 0x07 | ResourceRequest | Agent → Server | Request access to a resource |
+| 0x08 | ResourceGrant | Server → Agent | Approve resource access |
+| 0x09 | MeterAck | Agent → Server | Acknowledge metering report |
+| 0x0A | ResourceSuspend | Server → Agent | Suspend resource for constraint violation |
+| 0x0B | ResourceDeny | Server → Agent | Reject resource request |
+| 0x0C | ResourceRelease | Agent → Server | Release resource when done |
 | 0x0D | DisputeOpen | Agent → Auditor | Open a usage/billing dispute |
 | 0x0E | DisputeEvidence | Any → Auditor | Submit evidence for dispute |
 | 0x0F | DisputeVerdict | Auditor → All | Issue binding dispute resolution |
-| 0x10 | PriceNegotiate | Agent ↔ Server | Negotiate pricing terms |
-| 0x11 | PaymentChannel | Agent ↔ Server | Open/manage payment channel |
-| 0x12 | SettlementClose | Agent/Server → All | Close payment channel |
-| 0x13 | DiscoverAd | Agent → All | Broadcast capability advertisement |
-| 0x14 | DiscoverQuery | Agent → Registry | Query service registry |
+| 0x10 | MeterReport | Server → Agent | Report resource consumption |
+| 0x11 | ChannelOpen | Agent ↔ Server | Open payment channel |
+| 0x12 | ChannelClose | Agent/Server → All | Close payment channel |
+| 0x13 | PriceRequest | Agent → Server | Request pricing terms |
+| 0x14 | Alert | Any → Any | Protocol-level alert |
+| 0x15 | PriceOffer | Server → Agent | Offer pricing terms |
+| 0x16 | PriceAccept | Agent → Server | Accept pricing terms |
+| 0x17 | DelegationRequest | Agent₁ → Agent₂ | Request cross-domain delegation |
+| 0x18 | DelegationGrant | Agent₂ → Agent₁ | Approve cross-domain delegation |
+| 0x19 | ReconciliationRequest | Any → Any | Request metering reconciliation |
+| 0x1A | ReconciliationResponse | Any → Any | Respond to reconciliation |
+| 0x1B | OCSPRequest | Server → Issuer | Request token revocation status |
+| 0x1C | OCSPResponse | Issuer → Server | Return token revocation status |
 
 ## 1.6. Error Codes
 
@@ -118,6 +126,8 @@ QASP defines 20 message types:
 | 0xFF | INTERNAL_ERROR | Retry or abort |
 
 Every error response includes a `retry_after` field (seconds) and a `detail` string. Clients MUST implement exponential backoff for retryable errors with a maximum of 5 retries.
+
+**Implementation**: The `QASPErrorCode` enum (`protocol/exceptions.py`) defines all 13 wire-level error codes as an `IntEnum`. The `error_code_for_exception()` function maps Python exception types (e.g., `HandshakeVersionError` → `VERSION_MISMATCH`, `HandshakeAuthError` → `AUTH_FAILED`) to their wire codes, returning `INTERNAL_ERROR` (0xFF) for unmapped exceptions.
 
 ---
 
@@ -199,13 +209,19 @@ The DID Document follows the W3C DID Core specification and contains:
 
 ### 2.2.3. DID Resolution
 
-DID Documents are resolved via three mechanisms in priority order:
+DID Documents are resolved via a multi-tier resolution architecture (implemented in `identity/resolver.py`):
 
-1. **Direct exchange**: During QASP-Shake, peers include their DID Documents in the handshake messages. This is fully decentralized — no infrastructure needed.
+**Tier 1 — L1 Cache**: An in-process LRU cache with configurable TTL provides instant resolution for recently-seen DIDs. Cache hits avoid all network and registry lookups.
 
+**Tier 2 — L2 DIDRegistry**: An in-memory registry (`identity/did.py`) populated during QASP-Shake handshake exchanges. Thread-safe with Lock-based concurrent access.
+
+**Tier 3 — L3 Backend (DHT/VDR)**: A pluggable resolver backend (conforming to the `ResolverBackend` protocol) for persistent storage. The reference implementation uses SQLite. Each entry is a signed `DHTEntry` structure with version-based replay prevention — a newer `version` field must strictly exceed the stored version to accept an update. The entry is signed by the agent's ML-DSA-65 key, ensuring only the key holder can publish or update it.
+
+Resolution proceeds through tiers in order (L1 → L2 → L3), with successful lookups populating higher-tier caches for subsequent requests.
+
+DID Documents are also available through two additional channels:
+1. **Direct exchange**: During QASP-Shake, peers include their DID Documents in handshake messages — fully decentralized, no infrastructure needed.
 2. **QASP-Discover**: DID Documents are embedded in PQ-signed capability advertisements broadcast via DNS-SD/mDNS.
-
-3. **DID resolver network**: For asynchronous resolution, DID Documents are published to a distributed hash table (DHT) or a Verifiable Data Registry (VDR). The registry entry is signed by the agent's ML-DSA-65 key, ensuring only the key holder can update it.
 
 ### 2.2.4. Owner Binding
 
@@ -420,6 +436,27 @@ During QASP-Shake:
 | Verify time | ~120μs | ~0.8ms | ~0.9ms |
 | KEM encaps time | ~100μs | ~0.6ms | ~0.7ms |
 
+## 4.8. Connection Management
+
+The `QASPConnection` class (`protocol/connection.py`) implements a sans-I/O connection manager that separates protocol logic from transport:
+
+- **`receive_bytes(data)`**: Feed incoming bytes from the transport layer
+- **`bytes_to_send()`**: Retrieve outgoing bytes to send on the transport
+- **`send_data(payload)`**: Queue application data for encrypted transmission
+
+The connection manages handshake timeout with exponential backoff and generates typed events (from `protocol/events.py`) for state changes. The sans-I/O design enables use with any transport (TCP, QUIC, in-memory) and simplifies testing.
+
+## 4.9. Stream Multiplexing
+
+The `StreamManager` (`protocol/stream.py`) provides HTTP/2-style stream multiplexing over a single QASP connection:
+
+- **Stream ID convention**: Odd IDs for client-initiated streams, even IDs for server-initiated
+- **`StreamFrame`**: Carries stream ID, payload, and flags (including `END_STREAM`)
+- **`StreamState`** FSM: `OPEN` → `HALF_CLOSED_LOCAL` / `HALF_CLOSED_REMOTE` → `CLOSED`
+- **`Stream`**: Individual stream with send/receive buffers and state tracking
+
+This enables concurrent, independent request-response flows over a single authenticated channel without head-of-line blocking.
+
 ---
 
 # 5. Universal Agent Resource Model (ARM)
@@ -464,6 +501,8 @@ ARM defines seven canonical verbs spanning the full lifecycle of agent-resource 
 | `revoke` | Invalidate a token and its descendants | Cancel a compromised credential |
 
 Every capability token contains a subset of these verbs. The server enforces that the requested action is in the token's verb set. An agent with `[exec, read]` cannot `write` or `delegate`.
+
+**Implementation**: The seven canonical verbs are defined as constants (`ARM_READ` through `ARM_REVOKE`) in `protocol/capability.py`, with an `ARM_VERBS` frozenset containing all seven. These constants ensure consistent verb usage across the codebase and can be used directly with `VerbSet(ARM_VERBS)` for token construction.
 
 ## 5.3. First-Class Constraints
 
@@ -631,6 +670,8 @@ The construction uses Shamir secret sharing over the ML-DSA-65 signing key: each
 
 Example: A $1M compute budget requires 3-of-5 board members to sign the token. No individual can unilaterally authorize the expenditure.
 
+**Implementation**: The `identity/group.py` module provides `ThresholdGroup` for managing group DIDs created from distributed key generation (DKG) results. Key functions include `create_threshold_group()` (creates a group DID from DKG output), `is_threshold_did()` (checks if a DID represents a threshold group), and `get_threshold_policy()` (retrieves M-of-N policy from the DID Document service endpoint). The threshold policy is encoded in the group's DID Document service endpoint metadata.
+
 ## 6.6. Temporal Capability Evolution
 
 Tokens may include a `temporal_attenuation` schedule that automatically reduces permissions over time:
@@ -731,6 +772,15 @@ Every capability token includes two additional ARM fields for tool-chain confine
 
 Together, firebreaks and context binding confine the blast radius of any single compromised agent or tool within a multi-step workflow.
 
+## 6.11. Token Replay Prevention
+
+The `TokenUseLog` (`protocol/token_use_log.py`) provides thread-safe single-use enforcement for capability tokens:
+
+- **`mark_used(token_id)`**: Atomically marks a token ID as used. Raises `TokenReplayError` if already used.
+- **`is_used(token_id)`**: Check whether a token has been consumed.
+
+This prevents replay attacks where an attacker captures and re-submits a valid capability token. The log is checked at token verification time, before any resource access is granted.
+
 ---
 
 # 7. QASP-Meter: Metering and Accounting
@@ -796,6 +846,17 @@ Dual-signed receipts provide non-repudiation, but tool arguments may contain pri
 **Argument hashing**: Trace entries include `H(args)` rather than raw arguments. The full arguments are revealed only during dispute resolution and only to the Auditor under NDA/smart-contract terms.
 
 **Auditor-only decryption**: Sensitive argument fields are encrypted to the Auditor's public key at trace time. Neither the server nor the agent can read each other's private arguments post-hoc, but the Auditor can reconstruct the full trace if needed for dispute resolution.
+
+## 7.4. Budget Enforcement
+
+The `BudgetMeter` (`protocol/budget.py`) enforces budget ceilings on resource consumption:
+
+- **Budget ceiling**: A maximum spend amount set at session creation
+- **`MeterStatus` enum**: `ACTIVE` (under budget) or `SUSPENDED` (budget exhausted)
+- **`BudgetExhaustedError`**: Raised when a metering update would exceed the ceiling
+- **Automatic suspension**: When remaining budget falls below a threshold, the meter transitions to `SUSPENDED` and the server issues a `ResourceSuspend` message
+
+This ensures agents cannot overspend, with enforcement at the protocol layer rather than relying on server-side billing.
 
 ---
 
@@ -903,6 +964,23 @@ The Auditor issues DisputeVerdict (0x0F) containing:
 
 The payment channel state is updated to reflect the verdict. If either party refuses, the Auditor's verdict serves as evidence for out-of-band enforcement (reputation systems, legal recourse).
 
+### Implementation: Reconciliation Engine
+
+The reconciliation subsystem (`protocol/reconciliation.py`) implements the dispute resolution flow:
+
+- **`DivergenceDetector`**: Compares receipt chains with configurable tolerance (default: 5% or 100-unit floor). Detects the first receipt where agent and server views diverge.
+- **`ReconciliationSession`**: An FSM managing the reconciliation lifecycle with a 60-second grace period. States: `PENDING` → `EXCHANGING` → `RESOLVED` / `FAILED`.
+- **Resolution methods**: `AGREED` (chains match), `HIGHER_SEQ_WINS` (use the receipt with the higher sequence number), `USE_AVERAGE` (split the difference when within tolerance).
+- **Evidence bounds**: Configurable `MAX_RECEIPT_RANGE` and `MAX_TRACE_ENTRIES_PER_TOKEN` prevent denial-of-service via evidence flooding.
+
+### Implementation: Fault Attribution
+
+The `FaultAttributor` (`auditor/fault.py`) performs systematic fault analysis:
+
+- **Fault types**: `METERING_ERROR`, `BILLING_ERROR`, `CONSTRAINT_VIOLATION`, `SIGNATURE_INVALID`, `CHAIN_BROKEN`
+- **Attribution rules**: Each fault type maps to systematic rules determining which party is responsible
+- **`AuditorService`**: The `auditor/service.py` module provides an integrated auditor with trace decryption capability (using the auditor's ML-KEM-768 key pair) for full-chain replay analysis
+
 ---
 
 # 9. Revocation Architecture
@@ -920,6 +998,14 @@ Revoking credentials in a system with deep delegation chains and many active ses
 - **QASP-OCSP**: An online status check where the server sends a token ID to the issuer's OCSP responder and receives a signed "good" / "revoked" / "unknown" response. The response includes a `nextUpdate` timestamp for stapling: servers cache the response and present it to agents as proof of status, avoiding repeated round-trips.
 
 Both CRL and OCSP responses use ML-DSA-65 signatures, maintaining PQ security throughout the revocation infrastructure.
+
+**Implementation**: The `OCSPResponder` (`protocol/ocsp.py`) provides a full OCSP implementation:
+
+- **`OCSPRequest`**: Contains token ID and a random nonce for replay prevention
+- **`OCSPResponse`**: Signed response with status (`GOOD`, `REVOKED`, `UNKNOWN`), validity window (`thisUpdate`/`nextUpdate`), and nonce echo
+- **`StapledOCSPResponse`**: Pre-fetched response bundled with a token for offline verification — servers cache responses and present them to agents without repeated round-trips
+- **Response caching**: Configurable validity period (default defined by `DEFAULT_RESPONSE_VALIDITY_SECONDS`)
+- **Nonce validation**: Request nonces are echoed in responses to prevent replay attacks (`OCSPNonceMismatchError` on mismatch)
 
 ## 9.2. Revocation Urgency Levels
 
@@ -1144,6 +1230,15 @@ Statistical divergence measures detect when an agent's behavior drifts beyond it
 
 If divergence exceeds a threshold, the behavioral compliance score drops. This catches subtle capability violations that discrete FSM rules might miss — for example, a "document summarizer" that gradually starts making more and more API calls to external services.
 
+**Implementation**: The `DriftDetector` class (`trust/behavioral.py`) provides:
+
+- **`BehaviorDistribution`**: A frozen dataclass representing a normalized probability distribution over `BehaviorType` values (REQUEST, RESPONSE, ERROR, TIMEOUT, RATE_LIMIT, POLICY_VIOLATION)
+- **`kl_divergence(p, q)`**: KL(P || Q) with Laplace smoothing to handle zero probabilities
+- **`wasserstein_distance(p, q)`**: Wasserstein-1 (earth mover's) distance over the canonical BehaviorType ordering
+- **`compute_drift_score(current)`**: Weighted combination of normalized KL and Wasserstein scores, clamped to [0.0, 1.0]. Configurable thresholds (default: KL=2.0, W=1.0) and weights (default: KL=0.6, W=0.4).
+- **`distribution_from_events(events)`**: Builds a `BehaviorDistribution` from a list of `BehaviorEvent` records
+- **`BehavioralVerifier.detect_drift()`**: Convenience method that splits recorded events into baseline (first half) and current (second half) for automatic drift assessment
+
 ### 10.5.4. Compliance Score Computation
 
 ```
@@ -1172,6 +1267,17 @@ PoE = {
   signature:     bytes       -- ML-DSA-65 by the monitoring layer
 }
 ```
+
+**Implementation**: The `ProofOfExecution` frozen dataclass and `PoEChain` class (`protocol/privacy.py`) provide:
+
+- **Result constants**: `POE_SUCCESS`, `POE_FAILURE`, `POE_VIOLATION`
+- **`create_proof_of_execution()`**: Creates a signed PoE with SHA-384 argument hashing and ML-DSA-65 signature
+- **`verify_proof_of_execution()`**: Verifies the ML-DSA-65 signature on a PoE
+- **`PoEChain`**: An ordered, hash-chained list of PoEs following the same pattern as `ReceiptChain` in `protocol/accounting.py`:
+  - `append(poe)` validates `prev_poe_hash` linkage (first entry must have empty hash)
+  - `verify(signer_pk)` verifies all signatures and hash chain integrity
+  - `latest_hash` property returns the SHA-384 hash of the most recent entry
+  - Full CBOR serialization/deserialization via `to_cbor()` / `from_cbor()`
 
 ## 10.6. Anti-Gaming Defenses
 
@@ -1351,3 +1457,70 @@ Five threat actors are considered:
 | Trust scoring | ✗ | ✗ | ✗ | ✗ | ✓ |
 | Audit certification | ✗ | ✗ | ✗ | ✗ | ✓ |
 | Behavioral verification | ✗ | ✗ | ✗ | ✗ | ✓ |
+
+---
+
+# 14. Transport Layer
+
+QASP includes a pluggable transport layer for actual network communication.
+
+## 14.1. TCP Transport
+
+The `transport/tcp.py` module provides a TCP-based transport implementation:
+
+- Async server and client using Python's `asyncio` streams
+- Automatic integration with `QASPConnection` for handshake and encryption
+- Configurable bind address, port, and connection limits
+
+## 14.2. Service Discovery
+
+The `transport/discover.py` module implements QASP-Discover at the transport level:
+
+- DNS-SD/mDNS advertisement and browsing for local network discovery
+- Service registration with PQ-signed capability advertisements
+- Configurable TTL and refresh intervals
+
+## 14.3. Transport Registry
+
+The `transport/registry.py` module provides a pluggable transport registry:
+
+- Register transport implementations by name (e.g., "tcp", "quic")
+- Lookup and instantiate transports dynamically
+- Enables new transport backends without modifying protocol code
+
+---
+
+# 15. Reference Implementations
+
+## 15.1. ML-DSA-65 Pure Python Reference
+
+The `crypto/dilithium.py` module provides a pure-Python implementation of ML-DSA-65 (Dilithium) for educational and verification purposes. This reference implementation follows the FIPS 204 specification directly and is suitable for:
+
+- Algorithm comprehension and auditing
+- Cross-validation against the `oqs` (liboqs) production implementation
+- Environments where native library installation is impractical
+
+**Note**: The pure-Python implementation is significantly slower than the liboqs-backed implementation and should not be used in production.
+
+---
+
+# 16. Protocol Events System
+
+The `protocol/events.py` module defines 50+ typed event classes covering all protocol phases. Events are emitted by `QASPConnection` and transport components, enabling reactive programming patterns:
+
+- **Handshake events**: `HandshakeInitiated`, `HandshakeComplete`, `HandshakeFailed`
+- **Data events**: `DataReceived`, `DataSent`
+- **Connection events**: `ConnectionClosed`, `ConnectionError`
+- **Token events**: `TokenIssued`, `TokenRevoked`, `TokenVerified`
+- **Resource events**: `ResourceRequested`, `ResourceGranted`, `ResourceDenied`, `ResourceSuspended`, `ResourceReleased`
+- **Metering events**: `MeterReportReceived`, `MeterAckSent`
+- **Settlement events**: `ChannelOpened`, `ChannelClosed`, `ChannelDisputed`, `PriceOfferReceived`, `PriceAccepted`
+- **Reconciliation events**: `ReconciliationStarted`, `ReconciliationSucceeded`, `ReconciliationFailed`, `DivergenceDetected`
+- **Dispute events**: `DisputeOpened`, `DisputeEvidenceReceived`, `DisputeResolved`, `FaultAttributed`, `VerdictEnforced`
+- **Revocation events**: `RevocationCascadeComplete`, `RevocationGracePeriodStarted`
+- **Stream events**: `StreamOpened`, `StreamClosed`, `StreamDataReceived`
+- **Cross-domain events**: `CrossDomainDelegationRequested`, `CrossDomainDelegationGranted`, `CrossDomainDelegationRejected`, `CrossDomainDelegationRevoked`
+- **OCSP events**: `OCSPRequestReceived`, `OCSPResponseGenerated`
+- **Alert events**: `AlertReceived`
+
+All events inherit from the base `Event` class and carry a timestamp. This enables protocol-level observability, logging, and integration with monitoring systems.

@@ -1,10 +1,13 @@
 """Protocol exception definitions.
 
 This module defines exceptions specific to the QASP handshake protocol.
-These exceptions provide fine-grained error handling for handshake failures.
+These exceptions provide fine-grained error handling for handshake failures,
+plus unified wire-level error codes (Section 1.6).
 """
 
 from __future__ import annotations
+
+from enum import IntEnum
 
 from .states import ProtocolError
 
@@ -16,7 +19,32 @@ __all__ = [
     "HandshakeTimeoutError",
     "HandshakeUpgradeRequiredError",
     "HandshakeVersionError",
+    "QASPErrorCode",
+    "error_code_for_exception",
 ]
+
+
+# =============================================================================
+# Wire-level error codes (Section 1.6)
+# =============================================================================
+
+
+class QASPErrorCode(IntEnum):
+    """Unified wire-level error codes for QASP protocol messages."""
+
+    VERSION_MISMATCH = 0x01
+    SUITE_MISMATCH = 0x02
+    AUTH_FAILED = 0x03
+    KEM_FAILED = 0x04
+    TOKEN_EXPIRED = 0x05
+    TOKEN_REVOKED = 0x06
+    PERMISSION_DENIED = 0x07
+    RATE_LIMITED = 0x08
+    RESOURCE_UNAVAILABLE = 0x09
+    BUDGET_EXHAUSTED = 0x0A
+    RECONCILIATION_FAILED = 0x0B
+    CHANNEL_CLOSED = 0x0C
+    INTERNAL_ERROR = 0xFF
 
 
 class HandshakeError(ProtocolError):
@@ -164,3 +192,32 @@ class HandshakeTimeoutError(HandshakeError):
         super().__init__(message)
         self.stage = stage
         self.elapsed_ms = elapsed_ms
+
+
+# =============================================================================
+# Error code mapping
+# =============================================================================
+
+_EXCEPTION_TO_ERROR_CODE: dict[type, QASPErrorCode] = {
+    HandshakeVersionError: QASPErrorCode.VERSION_MISMATCH,
+    HandshakeSuiteError: QASPErrorCode.SUITE_MISMATCH,
+    HandshakeAuthError: QASPErrorCode.AUTH_FAILED,
+    HandshakeKEMError: QASPErrorCode.KEM_FAILED,
+    HandshakeUpgradeRequiredError: QASPErrorCode.SUITE_MISMATCH,
+    HandshakeTimeoutError: QASPErrorCode.INTERNAL_ERROR,
+}
+
+
+def error_code_for_exception(exc: Exception) -> QASPErrorCode:
+    """Map a protocol exception to a wire-level error code.
+
+    Args:
+        exc: The exception to map.
+
+    Returns:
+        The corresponding QASPErrorCode, or INTERNAL_ERROR for unknown types.
+    """
+    code = _EXCEPTION_TO_ERROR_CODE.get(type(exc))
+    if code is not None:
+        return code
+    return QASPErrorCode.INTERNAL_ERROR

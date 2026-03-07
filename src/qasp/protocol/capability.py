@@ -25,6 +25,14 @@ if TYPE_CHECKING:
     pass
 
 __all__ = [
+    "ARM_ATTENUATE",
+    "ARM_CHARGE",
+    "ARM_DELEGATE",
+    "ARM_EXEC",
+    "ARM_READ",
+    "ARM_REVOKE",
+    "ARM_VERBS",
+    "ARM_WRITE",
     "AttenuationError",
     "AuthorityChainEntry",
     "CapabilityError",
@@ -66,6 +74,19 @@ __all__ = [
 # Constants
 NONCE_SIZE = 16
 DEFAULT_VALIDITY_SECONDS = 3600
+
+# Canonical ARM verb constants (Section 5.2)
+ARM_READ = "read"
+ARM_WRITE = "write"
+ARM_EXEC = "exec"
+ARM_DELEGATE = "delegate"
+ARM_CHARGE = "charge"
+ARM_ATTENUATE = "attenuate"
+ARM_REVOKE = "revoke"
+ARM_VERBS: frozenset[str] = frozenset({
+    ARM_READ, ARM_WRITE, ARM_EXEC, ARM_DELEGATE,
+    ARM_CHARGE, ARM_ATTENUATE, ARM_REVOKE,
+})
 
 
 # =============================================================================
