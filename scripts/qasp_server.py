@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -259,15 +260,28 @@ def features():
 
 @app.post("/register")
 def register(body: RegisterRequest):
+    logger.info("--- POST /register ---")
+    logger.info("  Agent name: %s", body.name)
+    logger.info("  Tools declared: %s", [t.name for t in body.tools])
+    logger.info("  Callback URL: %s", body.callback_url or "(none)")
+
+    logger.info("  Generating ML-DSA-65 keypair (pub=1952 bytes, sec=4032 bytes)...")
+    t0 = time.perf_counter()
     pub, sec = generate_keypair()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info("  >> Keypair generated in %.1fms", elapsed_ms)
+
     did, did_doc = create_did(pub)
     did_str = str(did)
+    logger.info("  >> DID created: %s", did_str)
 
     # Register DID
     state.did_registry.register(did_doc)
+    logger.info("  >> DID document registered in DID registry")
 
     # Register trust entry
     state.trust_registry.register(did)
+    logger.info("  >> Trust entry initialised (score=0.5)")
 
     # Build tool list with resource URIs
     tools: list[dict[str, Any]] = []
@@ -280,6 +294,7 @@ def register(body: RegisterRequest):
             "input_schema": t.input_schema or {"type": "object"},
             "resource_uri": resource_uri,
         })
+        logger.info("  >> Tool '%s' -> ARM URI: %s", t.name, resource_uri)
 
     api_key = uuid.uuid4().hex
     agent = AgentRecord(
@@ -295,7 +310,7 @@ def register(body: RegisterRequest):
     state.agents_by_api_key[api_key] = agent
     state.agents_by_did[did_str] = agent
 
-    logger.info("Registered agent %s  DID=%s  tools=%d", body.name, did_str, len(tools))
+    logger.info("  Agent '%s' registered successfully (total agents: %d)", body.name, len(state.agents_by_did))
 
     return {
         "agent_id": agent.agent_id,
@@ -314,10 +329,14 @@ def discover(
     x_api_key: str | None = Header(None),
 ):
     _api_key(x_api_key)
+    logger.info("--- GET /discover ---")
+    logger.info("  Filter: capability=%s  min_trust=%.2f", capability, min_trust)
+
     results: list[dict[str, Any]] = []
     for agent in state.agents_by_did.values():
         trust = state.compute_trust(agent.did_str)
         if trust["score"] < min_trust:
+            logger.info("  Skipped '%s' (trust %.4f < min %.2f)", agent.name, trust["score"], min_trust)
             continue
 
         # Capability filter
@@ -327,8 +346,10 @@ def discover(
                 for t in agent.tools
             )
             if not matched:
+                logger.info("  Skipped '%s' (no matching capability)", agent.name)
                 continue
 
+        logger.info("  Matched '%s'  DID=%s  trust=%.4f  tools=%d", agent.name, agent.did_str, trust["score"], len(agent.tools))
         results.append({
             "name": agent.name,
             "did": agent.did_str,
@@ -338,6 +359,7 @@ def discover(
         })
 
     results.sort(key=lambda r: r["trust_score"], reverse=True)
+    logger.info("  Returning %d agents (sorted by trust)", len(results))
     return results
 
 
@@ -348,15 +370,25 @@ def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
     caller = state.resolve_agent(_api_key(x_api_key))
     target = state.resolve_target(body.target_did)
 
+    logger.info("--- POST /tokens/request ---")
+    logger.info("  Caller: '%s' (%s)", caller.name, caller.did_str)
+    logger.info("  Target: '%s' (%s)", target.name, target.did_str)
+    logger.info("  Tool:   %s", body.tool_name)
+
     # Find the tool
     tool = next((t for t in target.tools if t["name"] == body.tool_name), None)
     if tool is None:
+        logger.warning("  DENIED: Tool '%s' not found on target agent", body.tool_name)
         raise HTTPException(status_code=404, detail=f"Tool '{body.tool_name}' not found on target agent")
 
     resource_uri = tool["resource_uri"]
     verbs = set(body.verbs) if body.verbs else {ARM_EXEC}
+    logger.info("  Resource URI: %s", resource_uri)
+    logger.info("  Verbs: %s", sorted(verbs))
 
     # Authority issues token on behalf of the caller → target
+    logger.info("  Signing token with authority ML-DSA-65 key...")
+    t0 = time.perf_counter()
     token = create_token(
         issuer_did=state.did,
         issuer_secret_key=state.secret_key,
@@ -367,6 +399,8 @@ def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
         constraints=Constraints(rate_limit=10, rate_period_seconds=60),
         validity_seconds=3600,
     )
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info("  >> Token signed in %.1fms", elapsed_ms)
 
     # Register in CRL for OCSP tracking
     state.crl.register_token(token)
@@ -377,6 +411,10 @@ def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
     caller.tokens_issued[tid_hex] = token
 
     token_cbor = token.to_cbor_with_signature()
+
+    expires = token.constraints.not_after.isoformat() if token.constraints.not_after else "never"
+    logger.info("  >> Token issued: id=%s  expires=%s  rate_limit=10/60s", tid_hex[:16] + "...", expires)
+    logger.info("  >> Registered in CRL for OCSP tracking")
 
     return {
         "token": base64.b64encode(token_cbor).decode(),
@@ -391,6 +429,10 @@ def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
 def revoke_token(body: TokenRevokeRequest, x_api_key: str | None = Header(None)):
     caller = state.resolve_agent(_api_key(x_api_key))
 
+    logger.info("--- POST /tokens/revoke ---")
+    logger.info("  Revoker: '%s' (%s)", caller.name, caller.did_str)
+    logger.info("  Token ID: %s", body.token_id)
+
     token_id_bytes = bytes.fromhex(body.token_id)
 
     try:
@@ -402,10 +444,15 @@ def revoke_token(body: TokenRevokeRequest, x_api_key: str | None = Header(None))
             revoker_secret_key=state.secret_key,
         )
     except Exception as exc:
+        logger.warning("  FAILED: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Invalidate OCSP cache
     state.ocsp.invalidate(token_id_bytes)
+
+    logger.info("  >> Token revoked (reason=OWNER_REQUEST, urgency=CRITICAL)")
+    logger.info("  >> CRL entries created: %d (includes cascade children)", len(entries))
+    logger.info("  >> OCSP cache invalidated")
 
     return {
         "revoked": True,
@@ -416,16 +463,22 @@ def revoke_token(body: TokenRevokeRequest, x_api_key: str | None = Header(None))
 
 @app.get("/tokens/status/{token_id}")
 def token_status(token_id: str):
+    logger.info("--- GET /tokens/status/%s ---", token_id[:16] + "...")
+
     token_id_bytes = bytes.fromhex(token_id)
     request = create_ocsp_request(token_id_bytes)
     response = state.ocsp.handle_request(request)
 
+    status_name = OCSPStatus(response.status).name
     result: dict[str, Any] = {
         "token_id": token_id,
-        "status": OCSPStatus(response.status).name,
+        "status": status_name,
     }
     if response.revocation_time is not None:
         result["revoked_at"] = datetime.fromtimestamp(response.revocation_time, tz=UTC).isoformat()
+        logger.info("  >> OCSP status: %s (revoked at %s)", status_name, result["revoked_at"])
+    else:
+        logger.info("  >> OCSP status: %s", status_name)
     return result
 
 
@@ -436,9 +489,16 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
     caller = state.resolve_agent(_api_key(x_api_key))
     target = state.resolve_target(body.target_did)
 
+    logger.info("--- POST /tools/call ---")
+    logger.info("  Caller: '%s' (%s)", caller.name, caller.did_str)
+    logger.info("  Target: '%s' (%s)", target.name, target.did_str)
+    logger.info("  Tool:   %s", body.tool_name)
+    logger.info("  Args:   %s", body.arguments)
+
     # Find tool
     tool = next((t for t in target.tools if t["name"] == body.tool_name), None)
     if tool is None:
+        logger.warning("  DENIED: Tool '%s' not found on target", body.tool_name)
         raise HTTPException(status_code=404, detail=f"Tool '{body.tool_name}' not found")
 
     # Decode token
@@ -446,8 +506,11 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
         token_cbor = base64.b64decode(body.token)
         token = CapabilityToken.from_cbor(token_cbor)
     except Exception as exc:
+        logger.warning("  DENIED: Invalid token encoding: %s", exc)
         raise HTTPException(status_code=400, detail=f"Invalid token encoding: {exc}") from exc
 
+    logger.info("  [1/7] Verifying ML-DSA-65 signature...")
+    t0 = time.perf_counter()
     # 1) Verify signature, expiry, revocation
     try:
         verify_token(
@@ -457,18 +520,33 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
             crl=state.crl,
         )
     except Exception as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.warning("  DENIED: Token verification failed (%.1fms): %s", elapsed_ms, exc)
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    expires_str = token.constraints.not_after.isoformat() if token.constraints.not_after else "never"
+    logger.info("  [1/7] >> Signature valid (ML-DSA-65, verified in %.1fms)", elapsed_ms)
+    logger.info("  [2/7] >> Token not expired (expires %s)", expires_str)
+    logger.info("  [3/7] >> Token not revoked (CRL clear)")
 
     # 2) ARM URI scope check
+    logger.info("  [4/7] Checking ARM URI scope...")
+    logger.info("         Token grants: %s", token.resource_uri)
+    logger.info("         Tool requires: %s", tool["resource_uri"])
     if not uri_matches(token.resource_uri, tool["resource_uri"]):
+        logger.warning("  DENIED: ARM URI scope mismatch")
         raise HTTPException(
             status_code=403,
             detail=f"Resource URI mismatch: token grants '{token.resource_uri}', tool requires '{tool['resource_uri']}'",
         )
+    logger.info("  [4/7] >> ARM URI scope match confirmed")
 
     # 3) Verb check
+    logger.info("  [5/7] Checking verb permissions (token has: %s)...", sorted(token.verbs))
     if ARM_EXEC not in token.verbs:
+        logger.warning("  DENIED: Token missing 'exec' verb")
         raise HTTPException(status_code=403, detail="Token missing 'exec' verb")
+    logger.info("  [5/7] >> Verb 'exec' permitted")
 
     # 4) Rate limiting
     rate_limit = token.constraints.rate_limit or 10
@@ -478,27 +556,37 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
         rate_limit=rate_limit,
         rate_period_seconds=rate_period,
     )
+    tokens_before = limiter.tokens
     if not limiter.consume():
+        logger.warning("  DENIED: Rate limit exceeded (%d/%d used in %ds window)", rate_limit, rate_limit, rate_period)
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded ({rate_limit} calls per {rate_period}s). Retry after {1.0 / limiter.refill_rate:.1f}s",
         )
+    logger.info("  [6/7] >> Rate limit OK (%.0f/%d tokens remaining, %ds window)", limiter.tokens, rate_limit, rate_period)
 
     # 5) Relay to target callback
     call_result: Any = None
     if target.callback_url:
+        relay_url = f"{target.callback_url.rstrip('/')}/tools/{body.tool_name}"
+        logger.info("  [7/7] Relaying to callback: %s", relay_url)
+        t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
-                    f"{target.callback_url.rstrip('/')}/tools/{body.tool_name}",
+                    relay_url,
                     json=body.arguments,
                     headers={"X-QASP-Caller-DID": str(caller.did)},
                 )
                 call_result = resp.json()
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info("  [7/7] >> Relay complete (%d %s, %.0fms)", resp.status_code, resp.reason_phrase, elapsed_ms)
         except Exception as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.warning("  [7/7] >> Relay FAILED (%.0fms): %s", elapsed_ms, exc)
             call_result = {"error": f"Callback failed: {exc}"}
     else:
-        # No callback — echo the arguments as a demo placeholder
+        logger.info("  [7/7] No callback_url — echoing arguments (demo mode)")
         call_result = {
             "echo": body.arguments,
             "tool": body.tool_name,
@@ -516,12 +604,18 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
         "timestamp": datetime.now(UTC).isoformat(),
         **metering,
     })
+    logger.info("  >> Metering: receipt=%s  cost=%d credits", receipt_id[:12] + "...", metering["cost"])
 
     # 7) Report successful interaction for trust
+    old_trust = state.compute_trust(target.did_str)
     try:
         state.trust_registry.update_reputation(target.did_str, success=True)
     except Exception:
         pass
+    new_trust = state.compute_trust(target.did_str)
+    logger.info("  >> Trust updated for '%s': %.4f -> %.4f", target.name, old_trust["score"], new_trust["score"])
+
+    logger.info("  CALL COMPLETE (all 7 checks passed)")
 
     return {
         "result": call_result,
@@ -540,16 +634,26 @@ def get_trust(did: str):
 @app.post("/trust/{did}/report")
 def report_trust(did: str, body: TrustReportRequest, x_api_key: str | None = Header(None)):
     _api_key(x_api_key)
+
+    logger.info("--- POST /trust/%s/report ---", did[:24] + "...")
+    old_trust = state.compute_trust(did)
+    logger.info("  Outcome: %s", body.outcome)
+    logger.info("  Current trust: %.4f (%d interactions)", old_trust["score"], old_trust["interaction_count"])
+
     success = body.outcome.lower() == "success"
     try:
         state.trust_registry.update_reputation(did, success=success)
     except Exception as exc:
+        logger.warning("  FAILED: %s", exc)
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    new_trust = state.compute_trust(did)
+    logger.info("  >> Trust updated: %.4f -> %.4f (%+.4f)", old_trust["score"], new_trust["score"], new_trust["score"] - old_trust["score"])
 
     return {
         "did": did,
         "outcome": body.outcome,
-        "updated_trust": state.compute_trust(did),
+        "updated_trust": new_trust,
     }
 
 
@@ -558,6 +662,13 @@ def report_trust(did: str, body: TrustReportRequest, x_api_key: str | None = Hea
 @app.post("/disputes/open")
 def open_dispute(body: DisputeOpenRequest, x_api_key: str | None = Header(None)):
     caller = state.resolve_agent(_api_key(x_api_key))
+
+    logger.info("--- POST /disputes/open ---")
+    logger.info("  Claimant: '%s' (%s)", caller.name, caller.did_str)
+    logger.info("  Respondent DID: %s", body.respondent_did)
+    logger.info("  Type: %s", body.type)
+    logger.info("  Description: %s", body.description or "(none)")
+
     dispute_id = uuid.uuid4().hex
     dispute = {
         "dispute_id": dispute_id,
@@ -570,7 +681,7 @@ def open_dispute(body: DisputeOpenRequest, x_api_key: str | None = Header(None))
         "verdict": None,
     }
     state.disputes[dispute_id] = dispute
-    logger.info("Dispute opened: %s (%s vs %s)", dispute_id, caller.did_str, body.respondent_did)
+    logger.info("  >> Dispute created: id=%s  status=OPEN", dispute_id)
     return {"dispute_id": dispute_id, "status": "OPEN"}
 
 
@@ -596,18 +707,23 @@ def main() -> None:
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
     )
 
     global state
     state = AuthorityState()
 
     print()
-    print("=" * 60)
+    print("=" * 64)
     print("  QASP Authority Server")
     print(f"  DID:  {state.did}")
     print(f"  URL:  http://{args.host}:{args.port}")
-    print("=" * 60)
+    print()
+    print("  Crypto:  ML-DSA-65 (FIPS 204) post-quantum signatures")
+    print("  Tokens:  CBOR-encoded, 1hr validity, 10 calls/60s limit")
+    print("  Trust:   Bayesian scoring with anti-gaming caps")
+    print("=" * 64)
     print()
 
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
