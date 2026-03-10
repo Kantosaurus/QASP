@@ -161,6 +161,20 @@ from .stream import (
     StreamManager,
     StreamState,
 )
+from .arm import (
+    ARMUri,
+    InvalidARMUriError,
+    intersect_uris,
+    is_attenuation,
+    parse_uri,
+    uri_matches,
+)
+from .rate_limiter import (
+    RateLimitExceededError,
+    RateLimiterRegistry,
+    TokenBucketRateLimiter,
+    get_rate_limiter_registry,
+)
 from .token_aggregation import (
     AggregatedPermission,
     ConstraintConflictError,
@@ -269,6 +283,7 @@ from .threshold_delegation import (
 from .token_use_log import TokenReplayError, TokenUseLog
 
 __all__ = [
+    "ARMUri",
     "CANONICAL_FIELD_NAMES",
     "CHALLENGE_PERIOD_SECONDS",
     "CLOSE_REASON_COOPERATIVE",
@@ -350,6 +365,7 @@ __all__ = [
     "HandshakeVersionError",
     "InsufficientBalanceError",
     "InvalidAttestationError",
+    "InvalidARMUriError",
     "InvalidZKProofError",
     "InvalidAcceptanceError",
     "InvalidEndorsementError",
@@ -395,6 +411,8 @@ __all__ = [
     "ProtocolError",
     "QASPConnection",
     "QASPErrorCode",
+    "RateLimitExceededError",
+    "RateLimiterRegistry",
     "ReconciliationBoundsError",
     "ReconciliationError",
     "ReconciliationSession",
@@ -434,6 +452,7 @@ __all__ = [
     "SuspendReason",
     "ThresholdTokenMetadata",
     "TokenAggregationError",
+    "TokenBucketRateLimiter",
     "TokenAlreadyRevokedError",
     "TokenIssued",
     "TokenReplayError",
@@ -490,8 +509,13 @@ __all__ = [
     "ZKToken",
     "create_zk_token",
     "error_code_for_exception",
+    "get_rate_limiter_registry",
+    "intersect_uris",
+    "is_attenuation",
     "prove_field_equality",
     "prove_verb_membership",
     "prove_zk_range",
+    "parse_uri",
+    "uri_matches",
     "verify_zk_proof",
 ]

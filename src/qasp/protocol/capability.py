@@ -1127,11 +1127,29 @@ def _verify_usage_constraints(
             f"{usage.quantity_consumed} > {constraints.quantity_limit}"
         )
 
-    # Check rate limit
+    # Check rate limit (active token bucket + passive comparison)
     if constraints.rate_limit is not None:
-        now = datetime.now(UTC)
+        # Active rate limiting via token bucket
+        from qasp.protocol.rate_limiter import (
+            RateLimitExceededError,
+            get_rate_limiter_registry,
+        )
 
-        # Check if within rate period
+        registry = get_rate_limiter_registry()
+        limiter = registry.get_or_create(
+            token.token_id,
+            rate_limit=constraints.rate_limit,
+            rate_period_seconds=constraints.rate_period_seconds,
+        )
+        try:
+            limiter.consume_or_raise()
+        except RateLimitExceededError as e:
+            raise TokenConstraintViolation(
+                f"Rate limit exceeded (token bucket): {e}"
+            ) from e
+
+        # Passive comparison as fallback
+        now = datetime.now(UTC)
         if usage.period_start is not None:
             period_elapsed = (now - usage.period_start).total_seconds()
             if (
@@ -1345,6 +1363,7 @@ def attenuate_token(
     tightened_constraints: Constraints | None = None,
     toolchain_position: int | None = None,
     temporal_attenuation: TemporalSchedule | None = None,
+    resource_uri: str | None = None,
 ) -> CapabilityToken:
     """Create an attenuated token from a parent token.
 
@@ -1358,6 +1377,7 @@ def attenuate_token(
         tightened_constraints: Additional constraint tightening.
         toolchain_position: Toolchain position override (defaults to parent's).
         temporal_attenuation: Optional temporal decay schedule for the child token.
+        resource_uri: Narrowed resource URI (must be valid attenuation of parent).
 
     Returns:
         A new attenuated CapabilityToken.
@@ -1365,7 +1385,8 @@ def attenuate_token(
     Raises:
         TokenExpiredError: If the parent token has expired.
         DelegationDepthExceeded: If delegation depth is 0.
-        AttenuationError: If verbs are not a subset or constraints not tighter.
+        AttenuationError: If verbs are not a subset, constraints not tighter,
+            or resource URI is an escalation.
     """
     # Check parent hasn't expired
     if parent_token.is_expired():
@@ -1402,6 +1423,27 @@ def attenuate_token(
     else:
         new_tc_pos = parent_token.toolchain_position
 
+    # Determine resource URI: use narrowed URI or inherit parent's
+    if resource_uri is not None:
+        from qasp.protocol.arm import InvalidARMUriError, is_attenuation
+
+        try:
+            if not is_attenuation(parent_token.resource_uri, resource_uri):
+                raise AttenuationError(
+                    f"Resource URI '{resource_uri}' is not a valid attenuation "
+                    f"of parent URI '{parent_token.resource_uri}' (scope escalation)"
+                )
+        except InvalidARMUriError:
+            # If URIs don't conform to ARM format, require exact match
+            if resource_uri != parent_token.resource_uri:
+                raise AttenuationError(
+                    f"Resource URI '{resource_uri}' does not match "
+                    f"parent URI '{parent_token.resource_uri}'"
+                )
+        new_resource_uri = resource_uri
+    else:
+        new_resource_uri = parent_token.resource_uri
+
     # Determine temporal attenuation: inherit parent's if child doesn't specify one
     new_temporal = temporal_attenuation
     if new_temporal is None and parent_token.temporal_attenuation is not None:
@@ -1425,7 +1467,7 @@ def attenuate_token(
         issuer_did=parent_token.subject_did,  # Delegator becomes issuer
         subject_did=new_subject_did,
         audience_did=parent_token.audience_did,
-        resource_uri=parent_token.resource_uri,
+        resource_uri=new_resource_uri,
         verbs=new_verbs,
         constraints=new_constraints,
         issued_at=issued_at,
@@ -1444,7 +1486,7 @@ def attenuate_token(
         issuer_did=parent_token.subject_did,
         subject_did=new_subject_did,
         audience_did=parent_token.audience_did,
-        resource_uri=parent_token.resource_uri,
+        resource_uri=new_resource_uri,
         verbs=new_verbs,
         constraints=new_constraints,
         issued_at=issued_at,

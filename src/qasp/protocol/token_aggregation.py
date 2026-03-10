@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from qasp.protocol.arm import InvalidARMUriError, uri_matches
 from qasp.protocol.capability import (
     CapabilityError,
     CapabilityToken,
@@ -206,7 +207,19 @@ def check_action_permitted(
         raise TokenConstraintViolation(
             f"Verb '{requested_verb}' not in aggregated permissions"
         )
-    if requested_resource not in aggregation.resource_uris:
+    # Use ARM URI matching: check if any aggregated URI covers the request
+    resource_permitted = False
+    for uri in aggregation.resource_uris:
+        try:
+            if uri_matches(uri, requested_resource):
+                resource_permitted = True
+                break
+        except InvalidARMUriError:
+            # Fall back to exact match for non-ARM URIs
+            if uri == requested_resource:
+                resource_permitted = True
+                break
+    if not resource_permitted:
         raise TokenConstraintViolation(
             f"Resource '{requested_resource}' not in aggregated permissions"
         )

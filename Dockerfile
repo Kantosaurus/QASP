@@ -68,9 +68,10 @@ COPY pyproject.toml .
 COPY README.md .
 COPY src/ src/
 COPY tests/ tests/
+COPY scripts/ scripts/
 
-# Install all dependencies including dev tools
-RUN pip install -e ".[dev]"
+# Install all dependencies including dev tools + server deps
+RUN pip install -e ".[dev]" && pip install fastapi uvicorn httpx
 
 # Default to interactive bash shell
 ENTRYPOINT ["/bin/bash"]

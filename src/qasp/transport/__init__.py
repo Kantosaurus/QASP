@@ -47,6 +47,13 @@ from .registry import (
     match_capability,
     verify_registry_entry,
 )
+from .quic import (
+    DEFAULT_QUIC_PORT,
+    QASPQuicClient,
+    QASPQuicServer,
+    quic_connect,
+    quic_serve,
+)
 from .tcp import (
     DEFAULT_READ_SIZE,
     LENGTH_PREFIX_SIZE,
@@ -61,6 +68,7 @@ from .tcp import (
 __all__ = [
     "DEFAULT_AD_TTL",
     "DEFAULT_DISCOVERY_TIMEOUT",
+    "DEFAULT_QUIC_PORT",
     "DEFAULT_READ_SIZE",
     "DEFAULT_REGISTRY_TTL",
     "LENGTH_PREFIX_SIZE",
@@ -81,6 +89,8 @@ __all__ = [
     "DiscoveryServer",
     "DiscoveryTimeoutError",
     "FramingError",
+    "QASPQuicClient",
+    "QASPQuicServer",
     "ReceiveError",
     "RegistryEntry",
     "RegistryEntryError",
@@ -100,6 +110,8 @@ __all__ = [
     "get_agent_registry",
     "listen",
     "match_capability",
+    "quic_connect",
+    "quic_serve",
     "serve",
     "tcp",
     "verify_advertisement",
