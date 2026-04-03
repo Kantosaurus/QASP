@@ -6,13 +6,20 @@ Run:
 Every audience member registers via REST, discovers peers, requests
 capability tokens, and calls each other's tools — all secured by
 QASP with ML-DSA-65 post-quantum signatures.
+
+Optional dependencies:
+    pip install prometheus-client   # for GET /metrics endpoint
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import json
 import logging
+import re
+import sqlite3
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
@@ -22,6 +29,22 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
+from starlette.responses import Response
+
+# Optional: Prometheus metrics
+try:
+    from prometheus_client import (
+        CONTENT_TYPE_LATEST,
+        CollectorRegistry,
+        Counter,
+        Gauge,
+        Histogram,
+        generate_latest,
+    )
+
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
 
 from qasp.crypto.signatures import generate_keypair
 from qasp.identity.did import DID, DIDRegistry, create_did
@@ -44,6 +67,196 @@ from qasp.trust.registry import TrustRegistry
 from qasp.trust.scoring import TrustScorer
 
 logger = logging.getLogger("qasp.server")
+
+
+# ============================================================================
+# Persistent storage (SQLite)
+# ============================================================================
+
+_STORE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS metering_records (
+    receipt_id   TEXT PRIMARY KEY,
+    agent_did    TEXT NOT NULL,
+    tool         TEXT NOT NULL,
+    target_did   TEXT NOT NULL,
+    timestamp    TEXT NOT NULL,
+    units        INTEGER NOT NULL,
+    cost         INTEGER NOT NULL,
+    currency     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS token_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id     TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    timestamp    TEXT NOT NULL,
+    details      TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS disputes (
+    dispute_id      TEXT PRIMARY KEY,
+    claimant_did    TEXT NOT NULL,
+    respondent_did  TEXT NOT NULL,
+    type            TEXT NOT NULL,
+    description     TEXT DEFAULT '',
+    status          TEXT NOT NULL,
+    opened_at       TEXT NOT NULL,
+    verdict         TEXT
+);
+"""
+
+
+class PersistentStore:
+    """SQLite-backed persistence for metering, token events, and disputes."""
+
+    def __init__(self, db_path: str = ":memory:") -> None:
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        for statement in _STORE_SCHEMA.strip().split(";"):
+            statement = statement.strip()
+            if statement:
+                self._conn.execute(statement)
+        self._conn.commit()
+        # Enable WAL for file-based databases
+        if db_path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode=WAL")
+
+    # -- metering --
+
+    def insert_metering(self, agent_did: str, record: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO metering_records "
+                "(receipt_id, agent_did, tool, target_did, timestamp, units, cost, currency) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record["receipt_id"], agent_did, record["tool"],
+                    record["target"], record["timestamp"],
+                    record["units"], record["cost"], record["currency"],
+                ),
+            )
+            self._conn.commit()
+
+    def query_metering(
+        self,
+        agent_did: str,
+        tool: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses = ["agent_did = ?"]
+        params: list[Any] = [agent_did]
+        if tool:
+            clauses.append("tool = ?")
+            params.append(tool)
+        if since:
+            clauses.append("timestamp >= ?")
+            params.append(since)
+        if until:
+            clauses.append("timestamp <= ?")
+            params.append(until)
+        params.append(limit)
+        sql = (
+            "SELECT * FROM metering_records WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY timestamp DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def metering_summary(self, agent_did: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(units),0) AS total_units, "
+                "COALESCE(SUM(cost),0) AS total_cost, "
+                "COUNT(*) AS total_calls "
+                "FROM metering_records WHERE agent_did = ?",
+                (agent_did,),
+            ).fetchone()
+            by_tool_rows = self._conn.execute(
+                "SELECT tool, SUM(units) AS units, SUM(cost) AS cost, COUNT(*) AS calls "
+                "FROM metering_records WHERE agent_did = ? GROUP BY tool",
+                (agent_did,),
+            ).fetchall()
+        by_tool = {r["tool"]: {"units": r["units"], "cost": r["cost"], "calls": r["calls"]} for r in by_tool_rows}
+        return {
+            "total_units": row["total_units"],
+            "total_cost": row["total_cost"],
+            "total_calls": row["total_calls"],
+            "by_tool": by_tool,
+        }
+
+    # -- token events --
+
+    def insert_token_event(self, token_id: str, event_type: str, details: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO token_events (token_id, event_type, timestamp, details) "
+                "VALUES (?, ?, ?, ?)",
+                (token_id, event_type, datetime.now(UTC).isoformat(), details),
+            )
+            self._conn.commit()
+
+    def query_token_events(self, token_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT token_id, event_type, timestamp, details "
+                "FROM token_events WHERE token_id = ? ORDER BY id",
+                (token_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- disputes --
+
+    def insert_dispute(self, dispute: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO disputes "
+                "(dispute_id, claimant_did, respondent_did, type, description, status, opened_at, verdict) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    dispute["dispute_id"], dispute["claimant_did"],
+                    dispute["respondent_did"], dispute["type"],
+                    dispute.get("description", ""), dispute["status"],
+                    dispute["opened_at"],
+                    json.dumps(dispute["verdict"]) if dispute.get("verdict") else None,
+                ),
+            )
+            self._conn.commit()
+
+    def query_disputes(self, status: str | None = None) -> list[dict[str, Any]]:
+        if status:
+            sql = "SELECT * FROM disputes WHERE status = ? ORDER BY opened_at DESC"
+            params: tuple[Any, ...] = (status.upper(),)
+        else:
+            sql = "SELECT * FROM disputes ORDER BY opened_at DESC"
+            params = ()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            if d.get("verdict"):
+                d["verdict"] = json.loads(d["verdict"])
+            results.append(d)
+        return results
+
+    # -- receipts (cross-agent query) --
+
+    def query_all_metering(
+        self, agent_did: str | None = None, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if agent_did:
+            sql = "SELECT * FROM metering_records WHERE agent_did = ? ORDER BY timestamp DESC LIMIT ?"
+            params: tuple[Any, ...] = (agent_did, limit)
+        else:
+            sql = "SELECT * FROM metering_records ORDER BY timestamp DESC LIMIT ?"
+            params = (limit,)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
 
 # ============================================================================
 # Pydantic request/response models
@@ -131,7 +344,7 @@ class AgentRecord:
 class AuthorityState:
     """All server-side state, initialised at startup."""
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: str = ":memory:", admin_api_key: str | None = None) -> None:
         # Authority identity
         self.public_key, self.secret_key = generate_keypair()
         self.did, self.did_doc = create_did(self.public_key)
@@ -161,6 +374,12 @@ class AuthorityState:
 
         # Token lookup (token_id hex -> CapabilityToken)
         self.tokens: dict[str, CapabilityToken] = {}
+
+        # Persistent storage
+        self.store = PersistentStore(db_path)
+
+        # Admin API key
+        self.admin_api_key = admin_api_key or uuid.uuid4().hex
 
         logger.info("Authority DID: %s", self.did)
 
@@ -209,6 +428,73 @@ class AuthorityState:
 state: AuthorityState  # set in main()
 app = FastAPI(title="QASP Authority", version="0.1.0")
 
+# -- Prometheus metrics (conditional) --
+
+if PROMETHEUS_AVAILABLE:
+    METRICS_REGISTRY = CollectorRegistry()
+    AGENTS_REGISTERED = Gauge(
+        "qasp_agents_registered_total",
+        "Number of currently registered agents",
+        registry=METRICS_REGISTRY,
+    )
+    TOKENS_ISSUED = Counter(
+        "qasp_tokens_issued_total",
+        "Total capability tokens issued",
+        registry=METRICS_REGISTRY,
+    )
+    TOKENS_REVOKED = Counter(
+        "qasp_tokens_revoked_total",
+        "Total capability tokens revoked",
+        registry=METRICS_REGISTRY,
+    )
+    TOOL_CALLS = Counter(
+        "qasp_tool_calls_total",
+        "Total tool calls relayed",
+        ["status"],
+        registry=METRICS_REGISTRY,
+    )
+    TOOL_CALLS_RATE_LIMITED = Counter(
+        "qasp_tool_calls_rate_limited_total",
+        "Total tool calls rejected due to rate limiting",
+        registry=METRICS_REGISTRY,
+    )
+    DISPUTES_OPENED = Counter(
+        "qasp_disputes_opened_total",
+        "Total disputes opened",
+        registry=METRICS_REGISTRY,
+    )
+    METERING_UNITS = Counter(
+        "qasp_metering_units_total",
+        "Total metering units consumed",
+        registry=METRICS_REGISTRY,
+    )
+    METERING_COST = Counter(
+        "qasp_metering_cost_total",
+        "Total metering cost (credits)",
+        registry=METRICS_REGISTRY,
+    )
+    HTTP_REQUEST_DURATION = Histogram(
+        "qasp_http_request_duration_seconds",
+        "HTTP request duration in seconds",
+        ["method", "endpoint", "status_code"],
+        registry=METRICS_REGISTRY,
+    )
+
+    _PATH_NORMALIZE = re.compile(r"/[0-9a-f]{16,}")
+
+    @app.middleware("http")
+    async def metrics_middleware(request, call_next):  # type: ignore[no-untyped-def]
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration = time.perf_counter() - start
+        path = _PATH_NORMALIZE.sub("/{id}", request.url.path)
+        HTTP_REQUEST_DURATION.labels(
+            method=request.method,
+            endpoint=path,
+            status_code=response.status_code,
+        ).observe(duration)
+        return response
+
 
 def _api_key(x_api_key: str | None = Header(None)) -> str:
     if not x_api_key:
@@ -254,6 +540,21 @@ def features():
         {"id": "relay", "name": "Tool Call Relay", "description": "Verify token → relay to agent callback → meter usage"},
         {"id": "metering", "name": "Usage Metering", "description": "Per-call receipts with cost tracking"},
     ]
+
+
+# -- Metrics ----------------------------------------------------------------
+
+@app.get("/metrics")
+def metrics():
+    if not PROMETHEUS_AVAILABLE:
+        raise HTTPException(
+            status_code=501,
+            detail="prometheus-client not installed. Run: pip install prometheus-client",
+        )
+    return Response(
+        content=generate_latest(METRICS_REGISTRY),
+        media_type=CONTENT_TYPE_LATEST,
+    )
 
 
 # -- Registration -----------------------------------------------------------
@@ -311,6 +612,9 @@ def register(body: RegisterRequest):
     state.agents_by_did[did_str] = agent
 
     logger.info("  Agent '%s' registered successfully (total agents: %d)", body.name, len(state.agents_by_did))
+
+    if PROMETHEUS_AVAILABLE:
+        AGENTS_REGISTERED.set(len(state.agents_by_did))
 
     return {
         "agent_id": agent.agent_id,
@@ -409,6 +713,10 @@ def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
     tid_hex = token.token_id.hex()
     state.tokens[tid_hex] = token
     caller.tokens_issued[tid_hex] = token
+    state.store.insert_token_event(tid_hex, "issued", resource_uri)
+
+    if PROMETHEUS_AVAILABLE:
+        TOKENS_ISSUED.inc()
 
     token_cbor = token.to_cbor_with_signature()
 
@@ -449,6 +757,10 @@ def revoke_token(body: TokenRevokeRequest, x_api_key: str | None = Header(None))
 
     # Invalidate OCSP cache
     state.ocsp.invalidate(token_id_bytes)
+    state.store.insert_token_event(body.token_id, "revoked")
+
+    if PROMETHEUS_AVAILABLE:
+        TOKENS_REVOKED.inc()
 
     logger.info("  >> Token revoked (reason=OWNER_REQUEST, urgency=CRITICAL)")
     logger.info("  >> CRL entries created: %d (includes cascade children)", len(entries))
@@ -558,6 +870,8 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
     )
     tokens_before = limiter.tokens
     if not limiter.consume():
+        if PROMETHEUS_AVAILABLE:
+            TOOL_CALLS_RATE_LIMITED.inc()
         logger.warning("  DENIED: Rate limit exceeded (%d/%d used in %ds window)", rate_limit, rate_limit, rate_period)
         raise HTTPException(
             status_code=429,
@@ -597,13 +911,21 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
     # 6) Metering
     receipt_id = uuid.uuid4().hex
     metering = {"units": 1, "cost": 10, "currency": "credits"}
-    caller.metering.append({
+    metering_record = {
         "receipt_id": receipt_id,
         "tool": body.tool_name,
         "target": body.target_did,
         "timestamp": datetime.now(UTC).isoformat(),
         **metering,
-    })
+    }
+    caller.metering.append(metering_record)
+    state.store.insert_metering(caller.did_str, metering_record)
+
+    if PROMETHEUS_AVAILABLE:
+        TOOL_CALLS.labels(status="success").inc()
+        METERING_UNITS.inc(metering["units"])
+        METERING_COST.inc(metering["cost"])
+
     logger.info("  >> Metering: receipt=%s  cost=%d credits", receipt_id[:12] + "...", metering["cost"])
 
     # 7) Report successful interaction for trust
@@ -681,6 +1003,11 @@ def open_dispute(body: DisputeOpenRequest, x_api_key: str | None = Header(None))
         "verdict": None,
     }
     state.disputes[dispute_id] = dispute
+    state.store.insert_dispute(dispute)
+
+    if PROMETHEUS_AVAILABLE:
+        DISPUTES_OPENED.inc()
+
     logger.info("  >> Dispute created: id=%s  status=OPEN", dispute_id)
     return {"dispute_id": dispute_id, "status": "OPEN"}
 
@@ -693,6 +1020,127 @@ def get_dispute(dispute_id: str):
     return dispute
 
 
+# -- Admin ------------------------------------------------------------------
+
+
+def _admin_key(x_admin_key: str | None) -> str:
+    """Validate the admin API key from X-Admin-Key header."""
+    if not x_admin_key or x_admin_key != state.admin_api_key:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Admin-Key header")
+    return x_admin_key
+
+
+@app.get("/admin/agents")
+def admin_list_agents(x_admin_key: str | None = Header(None)):
+    _admin_key(x_admin_key)
+    agents = []
+    for agent in state.agents_by_did.values():
+        trust = state.compute_trust(agent.did_str)
+        agents.append({
+            "did": agent.did_str,
+            "name": agent.name,
+            "tools_count": len(agent.tools),
+            "tokens_issued": len(agent.tokens_issued),
+            "metering_count": len(agent.metering),
+            "trust_score": trust["score"],
+        })
+    return {"agents": agents, "total": len(agents)}
+
+
+@app.get("/admin/agents/{did}/metering")
+def admin_agent_metering(
+    did: str,
+    tool: str | None = Query(None),
+    since: str | None = Query(None),
+    until: str | None = Query(None),
+    limit: int = Query(100),
+    x_admin_key: str | None = Header(None),
+):
+    _admin_key(x_admin_key)
+    if did not in state.agents_by_did:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {did}")
+    records = state.store.query_metering(did, tool=tool, since=since, until=until, limit=limit)
+    return {"agent_did": did, "records": records, "total": len(records)}
+
+
+@app.get("/admin/agents/{did}/metering/summary")
+def admin_agent_metering_summary(did: str, x_admin_key: str | None = Header(None)):
+    _admin_key(x_admin_key)
+    if did not in state.agents_by_did:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {did}")
+    summary = state.store.metering_summary(did)
+    return {"agent_did": did, **summary}
+
+
+@app.get("/admin/receipts")
+def admin_receipts(
+    agent_did: str | None = Query(None),
+    limit: int = Query(100),
+    x_admin_key: str | None = Header(None),
+):
+    _admin_key(x_admin_key)
+    records = state.store.query_all_metering(agent_did=agent_did, limit=limit)
+    return {"records": records, "total": len(records)}
+
+
+@app.get("/admin/tokens")
+def admin_list_tokens(
+    status: str | None = Query(None),
+    x_admin_key: str | None = Header(None),
+):
+    _admin_key(x_admin_key)
+    tokens = []
+    for tid_hex, token in state.tokens.items():
+        token_id_bytes = bytes.fromhex(tid_hex)
+        is_revoked = state.crl.is_revoked(token_id_bytes)
+        is_expired = token.is_expired()
+        current_status = "revoked" if is_revoked else ("expired" if is_expired else "active")
+
+        if status and current_status != status.lower():
+            continue
+
+        tokens.append({
+            "token_id": tid_hex,
+            "subject_did": str(token.subject_did),
+            "audience_did": str(token.audience_did) if token.audience_did else None,
+            "resource_uri": token.resource_uri,
+            "verbs": sorted(token.verbs.verbs),
+            "status": current_status,
+            "expires_at": token.constraints.not_after.isoformat() if token.constraints.not_after else None,
+        })
+    return {"tokens": tokens, "total": len(tokens)}
+
+
+@app.get("/admin/tokens/{token_id}/history")
+def admin_token_history(token_id: str, x_admin_key: str | None = Header(None)):
+    _admin_key(x_admin_key)
+    if token_id not in state.tokens:
+        raise HTTPException(status_code=404, detail="Token not found")
+
+    token = state.tokens[token_id]
+    token_id_bytes = bytes.fromhex(token_id)
+    is_revoked = state.crl.is_revoked(token_id_bytes)
+    is_expired = token.is_expired()
+    current_status = "revoked" if is_revoked else ("expired" if is_expired else "active")
+
+    events = state.store.query_token_events(token_id)
+    return {
+        "token_id": token_id,
+        "current_status": current_status,
+        "events": events,
+    }
+
+
+@app.get("/admin/disputes")
+def admin_list_disputes(
+    status: str | None = Query(None),
+    x_admin_key: str | None = Header(None),
+):
+    _admin_key(x_admin_key)
+    disputes = state.store.query_disputes(status=status)
+    return {"disputes": disputes, "total": len(disputes)}
+
+
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -703,6 +1151,8 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument("--db", default="qasp_authority.db", help="SQLite database path (default: qasp_authority.db)")
+    parser.add_argument("--admin-key", default=None, help="Admin API key for /admin/ endpoints (auto-generated if omitted)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -712,7 +1162,7 @@ def main() -> None:
     )
 
     global state
-    state = AuthorityState()
+    state = AuthorityState(db_path=args.db, admin_api_key=args.admin_key)
 
     print()
     print("=" * 64)
@@ -723,6 +1173,10 @@ def main() -> None:
     print("  Crypto:  ML-DSA-65 (FIPS 204) post-quantum signatures")
     print("  Tokens:  CBOR-encoded, 1hr validity, 10 calls/60s limit")
     print("  Trust:   Bayesian scoring with anti-gaming caps")
+    print()
+    print(f"  DB:       {args.db}")
+    print(f"  Admin:    X-Admin-Key: {state.admin_api_key}")
+    print(f"  Metrics:  /metrics {'(prometheus-client loaded)' if PROMETHEUS_AVAILABLE else '(prometheus-client not installed)'}")
     print("=" * 64)
     print()
 
