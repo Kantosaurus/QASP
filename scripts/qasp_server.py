@@ -868,7 +868,7 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
         rate_limit=rate_limit,
         rate_period_seconds=rate_period,
     )
-    tokens_before = limiter.tokens
+    tokens_before = limiter.tokens_available
     if not limiter.consume():
         if PROMETHEUS_AVAILABLE:
             TOOL_CALLS_RATE_LIMITED.inc()
@@ -877,7 +877,7 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
             status_code=429,
             detail=f"Rate limit exceeded ({rate_limit} calls per {rate_period}s). Retry after {1.0 / limiter.refill_rate:.1f}s",
         )
-    logger.info("  [6/7] >> Rate limit OK (%.0f/%d tokens remaining, %ds window)", limiter.tokens, rate_limit, rate_period)
+    logger.info("  [6/7] >> Rate limit OK (%.0f/%d tokens remaining, %ds window)", limiter.tokens_available, rate_limit, rate_period)
 
     # 5) Relay to target callback
     call_result: Any = None
