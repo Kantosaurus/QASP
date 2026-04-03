@@ -14,6 +14,7 @@ Optional dependencies:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import logging
@@ -27,7 +28,7 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from starlette.responses import Response
 
@@ -119,6 +120,7 @@ CREATE TABLE IF NOT EXISTS messages (
     recipient_did    TEXT NOT NULL,
     content_type     TEXT NOT NULL DEFAULT 'text/plain',
     content          TEXT NOT NULL,
+    intent           TEXT DEFAULT NULL,
     reply_to         TEXT,
     created_at       TEXT NOT NULL,
     delivered        INTEGER NOT NULL DEFAULT 0,
@@ -322,13 +324,13 @@ class PersistentStore:
             self._conn.execute(
                 "INSERT OR IGNORE INTO messages "
                 "(message_id, conversation_id, sender_did, recipient_did, "
-                "content_type, content, reply_to, created_at, delivered) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "content_type, content, intent, reply_to, created_at, delivered) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     msg["message_id"], msg["conversation_id"],
                     msg["sender_did"], msg["recipient_did"],
                     msg.get("content_type", "text/plain"), msg["content"],
-                    msg.get("reply_to"), msg["created_at"],
+                    msg.get("intent"), msg.get("reply_to"), msg["created_at"],
                     1 if msg.get("delivered") else 0,
                 ),
             )
@@ -447,6 +449,7 @@ class MessageSendRequest(BaseModel):
     conversation_id: str
     content: str
     content_type: str = "text/plain"
+    intent: str | None = None
     reply_to: str | None = None
     token: str  # base64 capability token
 
@@ -536,6 +539,9 @@ class AuthorityState:
         # Persistent storage
         self.store = PersistentStore(db_path)
 
+        # WebSocket connection manager
+        self.ws_manager = ConnectionManager()
+
         # Admin API key
         self.admin_api_key = admin_api_key or uuid.uuid4().hex
 
@@ -577,6 +583,85 @@ class AuthorityState:
                 "confidence": round(score.confidence, 4),
             },
         }
+
+
+# ============================================================================
+# WebSocket connection manager
+# ============================================================================
+
+
+class ConnectionManager:
+    """Manages active WebSocket connections indexed by agent DID."""
+
+    def __init__(self) -> None:
+        self._connections: dict[str, WebSocket] = {}
+        self._lock = asyncio.Lock()
+        # Pending request-response futures keyed by request_id
+        self._pending: dict[str, asyncio.Future] = {}
+
+    async def connect(self, did_str: str, websocket: WebSocket) -> None:
+        async with self._lock:
+            old = self._connections.get(did_str)
+            if old is not None:
+                try:
+                    await old.close(code=4001, reason="Superseded by new connection")
+                except Exception:
+                    pass
+            self._connections[did_str] = websocket
+
+    async def disconnect(self, did_str: str) -> None:
+        async with self._lock:
+            self._connections.pop(did_str, None)
+
+    def is_connected(self, did_str: str) -> bool:
+        return did_str in self._connections
+
+    async def send_json(self, did_str: str, data: dict) -> bool:
+        ws = self._connections.get(did_str)
+        if ws is None:
+            return False
+        try:
+            await ws.send_json(data)
+            return True
+        except Exception:
+            await self.disconnect(did_str)
+            return False
+
+    async def send_and_wait(
+        self, did_str: str, data: dict, request_id: str, timeout: float = 30.0,
+    ) -> dict | None:
+        """Send a message and wait for a response matching request_id.
+
+        Used for tool call relay where the server needs the agent's result.
+        Returns the response payload, or None on timeout/failure.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict] = loop.create_future()
+        self._pending[request_id] = future
+
+        ok = await self.send_json(did_str, data)
+        if not ok:
+            self._pending.pop(request_id, None)
+            return None
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._pending.pop(request_id, None)
+
+    def resolve_pending(self, request_id: str, result: dict) -> bool:
+        """Resolve a pending request-response future. Called from WS listen loop."""
+        future = self._pending.get(request_id)
+        if future is None or future.done():
+            return False
+        future.set_result(result)
+        return True
+
+    @property
+    def connected_count(self) -> int:
+        return len(self._connections)
 
 
 # ============================================================================
@@ -646,6 +731,11 @@ if PROMETHEUS_AVAILABLE:
         "Total agent update operations",
         registry=METRICS_REGISTRY,
     )
+    WEBSOCKET_CONNECTIONS = Gauge(
+        "qasp_websocket_connections_active",
+        "Number of active WebSocket connections",
+        registry=METRICS_REGISTRY,
+    )
     HTTP_REQUEST_DURATION = Histogram(
         "qasp_http_request_duration_seconds",
         "HTTP request duration in seconds",
@@ -696,6 +786,7 @@ def root():
             "Dispute resolution",
             "Tool call relay with metering",
             "Agent-to-agent messaging with conversations",
+            "WebSocket real-time push",
         ],
     }
 
@@ -713,6 +804,7 @@ def features():
         {"id": "dispute", "name": "Dispute Resolution", "description": "Open disputes, evidence, binding verdicts"},
         {"id": "relay", "name": "Tool Call Relay", "description": "Verify token → relay to agent callback → meter usage"},
         {"id": "metering", "name": "Usage Metering", "description": "Per-call receipts with cost tracking"},
+        {"id": "websocket", "name": "WebSocket Push", "description": "Real-time server-to-agent delivery via persistent WebSocket connections"},
     ]
 
 
@@ -811,7 +903,7 @@ def register(body: RegisterRequest):
 # -- Agent update -----------------------------------------------------------
 
 @app.put("/agents/update")
-def update_agent(body: AgentUpdateRequest, x_api_key: str | None = Header(None)):
+async def update_agent(body: AgentUpdateRequest, x_api_key: str | None = Header(None)):
     agent = state.resolve_agent(_api_key(x_api_key))
 
     logger.info("--- PUT /agents/update ---")
@@ -898,6 +990,8 @@ def update_agent(body: AgentUpdateRequest, x_api_key: str | None = Header(None))
                     state.store.insert_token_event(tid_hex, "revoked", f"tool_removed:{tool_name}")
                     revoked_count += len(entries)
                     logger.info("    Revoked token %s... (%d entries incl. cascade)", tid_hex[:16], len(entries))
+                    # Notify holders of the revoked token (and cascade)
+                    await _notify_revocation(tid_hex, str(state.did), "PRIVILEGE_WITHDRAWN")
                 except Exception as exc:
                     logger.warning("    Failed to revoke token %s...: %s", tid_hex[:16], exc)
 
@@ -974,7 +1068,7 @@ def discover(
 # -- Token operations -------------------------------------------------------
 
 @app.post("/tokens/request")
-def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
+async def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
     caller = state.resolve_agent(_api_key(x_api_key))
     target = state.resolve_target(body.target_did)
 
@@ -1028,6 +1122,21 @@ def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
     logger.info("  >> Token issued: id=%s  expires=%s  rate_limit=10/60s", tid_hex[:16] + "...", expires)
     logger.info("  >> Registered in CRL for OCSP tracking")
 
+    # Notify target agent that a token was requested for their tool
+    if state.ws_manager.is_connected(target.did_str):
+        await state.ws_manager.send_json(target.did_str, {
+            "type": "token_requested",
+            "payload": {
+                "token_id": tid_hex,
+                "requester_did": caller.did_str,
+                "requester_name": caller.name,
+                "tool_name": body.tool_name,
+                "resource_uri": resource_uri,
+                "verbs": sorted(verbs),
+            },
+        })
+        logger.info("  >> Target notified of token request via WebSocket")
+
     return {
         "token": base64.b64encode(token_cbor).decode(),
         "token_id": tid_hex,
@@ -1038,7 +1147,7 @@ def request_token(body: TokenRequest, x_api_key: str | None = Header(None)):
 
 
 @app.post("/tokens/revoke")
-def revoke_token(body: TokenRevokeRequest, x_api_key: str | None = Header(None)):
+async def revoke_token(body: TokenRevokeRequest, x_api_key: str | None = Header(None)):
     caller = state.resolve_agent(_api_key(x_api_key))
 
     logger.info("--- POST /tokens/revoke ---")
@@ -1065,6 +1174,9 @@ def revoke_token(body: TokenRevokeRequest, x_api_key: str | None = Header(None))
 
     if PROMETHEUS_AVAILABLE:
         TOKENS_REVOKED.inc()
+
+    # Notify all affected agents via WebSocket (subject + cascade holders)
+    await _notify_revocation(body.token_id, caller.did_str, "OWNER_REQUEST")
 
     logger.info("  >> Token revoked (reason=OWNER_REQUEST, urgency=CRITICAL)")
     logger.info("  >> CRL entries created: %d (includes cascade children)", len(entries))
@@ -1183,9 +1295,38 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
         )
     logger.info("  [6/7] >> Rate limit OK (%.0f/%d tokens remaining, %ds window)", limiter.tokens_available, rate_limit, rate_period)
 
-    # 5) Relay to target callback
+    # 5) Relay to target: WebSocket > callback > echo
     call_result: Any = None
-    if target.callback_url:
+
+    # Tier 1: WebSocket relay (request-response)
+    if state.ws_manager.is_connected(target.did_str):
+        request_id = uuid.uuid4().hex
+        logger.info("  [7/7] Relaying via WebSocket (request_id=%s)...", request_id[:12])
+        t0 = time.perf_counter()
+        ws_result = await state.ws_manager.send_and_wait(
+            target.did_str,
+            {
+                "type": "tool_call",
+                "request_id": request_id,
+                "payload": {
+                    "tool_name": body.tool_name,
+                    "arguments": body.arguments,
+                    "caller_did": caller.did_str,
+                    "caller_name": caller.name,
+                },
+            },
+            request_id=request_id,
+            timeout=30.0,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        if ws_result is not None:
+            call_result = ws_result
+            logger.info("  [7/7] >> WebSocket relay complete (%.0fms)", elapsed_ms)
+        else:
+            logger.info("  [7/7] >> WebSocket relay timed out (%.0fms), falling back...", elapsed_ms)
+
+    # Tier 2: Callback relay
+    if call_result is None and target.callback_url:
         relay_url = f"{target.callback_url.rstrip('/')}/tools/{body.tool_name}"
         logger.info("  [7/7] Relaying to callback: %s", relay_url)
         t0 = time.perf_counter()
@@ -1198,18 +1339,20 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
                 )
                 call_result = resp.json()
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            logger.info("  [7/7] >> Relay complete (%d %s, %.0fms)", resp.status_code, resp.reason_phrase, elapsed_ms)
+            logger.info("  [7/7] >> Callback relay complete (%d %s, %.0fms)", resp.status_code, resp.reason_phrase, elapsed_ms)
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            logger.warning("  [7/7] >> Relay FAILED (%.0fms): %s", elapsed_ms, exc)
+            logger.warning("  [7/7] >> Callback relay FAILED (%.0fms): %s", elapsed_ms, exc)
             call_result = {"error": f"Callback failed: {exc}"}
-    else:
-        logger.info("  [7/7] No callback_url — echoing arguments (demo mode)")
+
+    # Tier 3: Echo (demo mode)
+    if call_result is None:
+        logger.info("  [7/7] No real-time channel — echoing arguments (demo mode)")
         call_result = {
             "echo": body.arguments,
             "tool": body.tool_name,
             "handled_by": target.name,
-            "note": "No callback_url configured; echoing arguments",
+            "note": "No callback_url or WebSocket connected; echoing arguments",
         }
 
     # 6) Metering
@@ -1258,7 +1401,7 @@ def get_trust(did: str):
 
 
 @app.post("/trust/{did}/report")
-def report_trust(did: str, body: TrustReportRequest, x_api_key: str | None = Header(None)):
+async def report_trust(did: str, body: TrustReportRequest, x_api_key: str | None = Header(None)):
     _api_key(x_api_key)
 
     logger.info("--- POST /trust/%s/report ---", did[:24] + "...")
@@ -1276,6 +1419,20 @@ def report_trust(did: str, body: TrustReportRequest, x_api_key: str | None = Hea
     new_trust = state.compute_trust(did)
     logger.info("  >> Trust updated: %.4f -> %.4f (%+.4f)", old_trust["score"], new_trust["score"], new_trust["score"] - old_trust["score"])
 
+    # Notify the affected agent of trust score change
+    if state.ws_manager.is_connected(did):
+        await state.ws_manager.send_json(did, {
+            "type": "trust_updated",
+            "payload": {
+                "old_score": old_trust["score"],
+                "new_score": new_trust["score"],
+                "delta": round(new_trust["score"] - old_trust["score"], 4),
+                "outcome": body.outcome,
+                "components": new_trust["components"],
+            },
+        })
+        logger.info("  >> Agent notified of trust change via WebSocket")
+
     return {
         "did": did,
         "outcome": body.outcome,
@@ -1286,7 +1443,7 @@ def report_trust(did: str, body: TrustReportRequest, x_api_key: str | None = Hea
 # -- Disputes ---------------------------------------------------------------
 
 @app.post("/disputes/open")
-def open_dispute(body: DisputeOpenRequest, x_api_key: str | None = Header(None)):
+async def open_dispute(body: DisputeOpenRequest, x_api_key: str | None = Header(None)):
     caller = state.resolve_agent(_api_key(x_api_key))
 
     logger.info("--- POST /disputes/open ---")
@@ -1296,6 +1453,7 @@ def open_dispute(body: DisputeOpenRequest, x_api_key: str | None = Header(None))
     logger.info("  Description: %s", body.description or "(none)")
 
     dispute_id = uuid.uuid4().hex
+    now = datetime.now(UTC).isoformat()
     dispute = {
         "dispute_id": dispute_id,
         "claimant_did": caller.did_str,
@@ -1303,7 +1461,7 @@ def open_dispute(body: DisputeOpenRequest, x_api_key: str | None = Header(None))
         "type": body.type,
         "description": body.description,
         "status": "OPEN",
-        "opened_at": datetime.now(UTC).isoformat(),
+        "opened_at": now,
         "verdict": None,
     }
     state.disputes[dispute_id] = dispute
@@ -1311,6 +1469,21 @@ def open_dispute(body: DisputeOpenRequest, x_api_key: str | None = Header(None))
 
     if PROMETHEUS_AVAILABLE:
         DISPUTES_OPENED.inc()
+
+    # Notify respondent via WebSocket
+    if state.ws_manager.is_connected(body.respondent_did):
+        await state.ws_manager.send_json(body.respondent_did, {
+            "type": "dispute_opened",
+            "payload": {
+                "dispute_id": dispute_id,
+                "claimant_did": caller.did_str,
+                "claimant_name": caller.name,
+                "type": body.type,
+                "description": body.description,
+                "opened_at": now,
+            },
+        })
+        logger.info("  >> Respondent notified via WebSocket")
 
     logger.info("  >> Dispute created: id=%s  status=OPEN", dispute_id)
     return {"dispute_id": dispute_id, "status": "OPEN"}
@@ -1391,7 +1564,7 @@ MIN_MESSAGE_TRUST_SCORE = 0.3
 
 
 @app.post("/conversations/open")
-def open_conversation(body: ConversationOpenRequest, x_api_key: str | None = Header(None)):
+async def open_conversation(body: ConversationOpenRequest, x_api_key: str | None = Header(None)):
     caller = state.resolve_agent(_api_key(x_api_key))
     target = state.resolve_target(body.target_did)
 
@@ -1446,18 +1619,24 @@ def open_conversation(body: ConversationOpenRequest, x_api_key: str | None = Hea
         CONVERSATIONS_OPENED.inc()
         TOKENS_ISSUED.inc()
 
-    # Attempt to notify target via callback
-    if target.callback_url:
+    # Notify target: WebSocket > callback
+    conv_payload = {
+        "conversation_id": conversation_id,
+        "initiator_did": caller.did_str,
+        "initiator_name": caller.name,
+        "topic": body.topic,
+    }
+    if state.ws_manager.is_connected(target.did_str):
+        await state.ws_manager.send_json(
+            target.did_str, {"type": "conversation_opened", "payload": conv_payload},
+        )
+        logger.info("  >> Target notified via WebSocket")
+    elif target.callback_url:
         try:
             with httpx.Client(timeout=10) as client:
                 client.post(
                     f"{target.callback_url.rstrip('/')}/conversations/new",
-                    json={
-                        "conversation_id": conversation_id,
-                        "initiator_did": caller.did_str,
-                        "initiator_name": caller.name,
-                        "topic": body.topic,
-                    },
+                    json=conv_payload,
                     headers={"X-QASP-Caller-DID": caller.did_str},
                 )
             logger.info("  >> Target notified via callback")
@@ -1483,6 +1662,8 @@ async def send_message(body: MessageSendRequest, x_api_key: str | None = Header(
     logger.info("--- POST /messages/send ---")
     logger.info("  Sender: '%s' (%s)", caller.name, caller.did_str)
     logger.info("  Conversation: %s", body.conversation_id)
+    logger.info("  Content: %.80s%s", body.content, "..." if len(body.content) > 80 else "")
+    logger.info("  Intent: %s", body.intent or "unclassified")
 
     # Validate conversation exists and caller is a participant
     conv = state.store.get_conversation(body.conversation_id)
@@ -1530,13 +1711,39 @@ async def send_message(body: MessageSendRequest, x_api_key: str | None = Header(
         "recipient_did": recipient_did,
         "content_type": body.content_type,
         "content": body.content,
+        "intent": body.intent,
         "reply_to": body.reply_to,
         "created_at": now,
         "delivered": False,
     }
 
-    # Attempt callback relay
-    if target.callback_url:
+    # 3-tier delivery: WebSocket > callback > inbox polling
+    relay_payload = {
+        "message_id": message_id,
+        "conversation_id": body.conversation_id,
+        "sender_did": caller.did_str,
+        "sender_name": caller.name,
+        "content_type": body.content_type,
+        "content": body.content,
+        "intent": body.intent,
+        "reply_to": body.reply_to,
+        "created_at": now,
+    }
+
+    # Tier 1: WebSocket push
+    if state.ws_manager.is_connected(recipient_did):
+        logger.info("  Delivering via WebSocket...")
+        ws_ok = await state.ws_manager.send_json(
+            recipient_did, {"type": "message", "payload": relay_payload},
+        )
+        if ws_ok:
+            delivered = True
+            logger.info("  >> Delivered via WebSocket")
+        else:
+            logger.info("  >> WebSocket delivery failed, falling back...")
+
+    # Tier 2: Callback relay
+    if not delivered and target.callback_url:
         relay_url = f"{target.callback_url.rstrip('/')}/messages/{body.conversation_id}"
         logger.info("  Relaying to callback: %s", relay_url)
         t0 = time.perf_counter()
@@ -1544,16 +1751,7 @@ async def send_message(body: MessageSendRequest, x_api_key: str | None = Header(
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     relay_url,
-                    json={
-                        "message_id": message_id,
-                        "conversation_id": body.conversation_id,
-                        "sender_did": caller.did_str,
-                        "sender_name": caller.name,
-                        "content_type": body.content_type,
-                        "content": body.content,
-                        "reply_to": body.reply_to,
-                        "created_at": now,
-                    },
+                    json=relay_payload,
                     headers={
                         "X-QASP-Caller-DID": caller.did_str,
                         "X-QASP-Message-ID": message_id,
@@ -1566,8 +1764,10 @@ async def send_message(body: MessageSendRequest, x_api_key: str | None = Header(
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000
             logger.warning("  >> Relay FAILED (%.0fms): %s", elapsed_ms, exc)
-    else:
-        logger.info("  No callback_url — message queued for inbox polling")
+
+    # Tier 3: Inbox polling (no action needed — message stored undelivered)
+    if not delivered:
+        logger.info("  No real-time channel — message queued for inbox polling")
 
     msg_record["delivered"] = delivered
     state.store.insert_message(msg_record)
@@ -1639,6 +1839,48 @@ def get_conversation_messages(
     return {"conversation_id": conversation_id, "messages": messages, "total": len(messages)}
 
 
+@app.get("/conversations/{conversation_id}/transcript")
+def get_conversation_transcript(
+    conversation_id: str,
+    x_api_key: str | None = Header(None),
+):
+    caller = state.resolve_agent(_api_key(x_api_key))
+
+    conv = state.store.get_conversation(conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if caller.did_str not in (conv["initiator_did"], conv["participant_did"]):
+        raise HTTPException(status_code=403, detail="Not a participant in this conversation")
+
+    messages = state.store.query_messages(conversation_id, limit=500)
+
+    # Build agent name lookup
+    names: dict[str, str] = {}
+    for ag in state.agents.values():
+        names[ag.did_str] = ag.name
+
+    lines: list[str] = []
+    topic = conv.get("topic", "")
+    if topic:
+        lines.append(f"Topic: {topic}")
+        lines.append("")
+    for msg in messages:
+        sender = names.get(msg["sender_did"], msg["sender_did"][:16])
+        ts = msg["created_at"]
+        intent_tag = f" [{msg.get('intent', '')}]" if msg.get("intent") else ""
+        lines.append(f"[{ts}] {sender}{intent_tag}: {msg['content']}")
+
+    logger.info("--- GET /conversations/%s/transcript ---", conversation_id[:12] + "...")
+    logger.info("  %d messages for '%s'", len(messages), caller.name)
+
+    return {
+        "conversation_id": conversation_id,
+        "topic": topic,
+        "transcript": "\n".join(lines),
+        "message_count": len(messages),
+    }
+
+
 @app.post("/conversations/{conversation_id}/close")
 def close_conversation(conversation_id: str, x_api_key: str | None = Header(None)):
     caller = state.resolve_agent(_api_key(x_api_key))
@@ -1687,6 +1929,120 @@ def acknowledge_message(body: MessageAckRequest, x_api_key: str | None = Header(
 
     state.store.mark_message_delivered(body.message_id)
     return {"message_id": body.message_id, "acknowledged": True}
+
+
+# -- WebSocket helpers -------------------------------------------------------
+
+
+async def _notify_revocation(token_id_hex: str, revoker_did: str, reason: str) -> int:
+    """Push token_revoked to the subject AND all holders of cascaded descendants.
+
+    Returns the number of agents notified.
+    """
+    notified: set[str] = set()
+    # Collect all affected token IDs (the revoked token + any cascade children)
+    affected_tids = [token_id_hex]
+    # Check CRL entries for cascaded revocations sharing the same root
+    for tid_hex, tok in state.tokens.items():
+        if tid_hex == token_id_hex:
+            continue
+        token_id_bytes = bytes.fromhex(tid_hex)
+        if state.crl.is_revoked(token_id_bytes):
+            # If this token's parent is the revoked one, it's part of the cascade
+            if tok.parent_token_hash is not None:
+                parent_hex = tok.parent_token_hash.hex()
+                if parent_hex == token_id_hex or parent_hex in affected_tids:
+                    affected_tids.append(tid_hex)
+
+    for tid_hex in affected_tids:
+        tok = state.tokens.get(tid_hex)
+        if tok is None:
+            continue
+        subject_did = str(tok.subject_did)
+        if subject_did in notified:
+            continue
+        if state.ws_manager.is_connected(subject_did):
+            await state.ws_manager.send_json(subject_did, {
+                "type": "token_revoked",
+                "payload": {
+                    "token_id": tid_hex,
+                    "revoker_did": revoker_did,
+                    "reason": reason,
+                },
+            })
+            notified.add(subject_did)
+
+    if notified:
+        logger.info("  >> Revocation notices pushed to %d agent(s) via WebSocket", len(notified))
+    return len(notified)
+
+
+# -- WebSocket real-time channel ---------------------------------------------
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, api_key: str = Query(...)):
+    # Authenticate before accepting
+    agent = state.agents_by_api_key.get(api_key)
+    if agent is None:
+        await websocket.close(code=4003, reason="Invalid API key")
+        return
+
+    await websocket.accept()
+    await state.ws_manager.connect(agent.did_str, websocket)
+    if PROMETHEUS_AVAILABLE:
+        WEBSOCKET_CONNECTIONS.inc()
+    logger.info("WebSocket CONNECTED: '%s' (%s)", agent.name, agent.did_str)
+
+    # Welcome message
+    await websocket.send_json({
+        "type": "connected",
+        "agent_did": agent.did_str,
+        "server_did": str(state.did),
+        "timestamp": datetime.now(UTC).isoformat(),
+    })
+
+    # Flush pending inbox messages
+    pending = state.store.query_inbox(agent.did_str, limit=50)
+    for msg in pending:
+        await websocket.send_json({"type": "message", "payload": msg})
+        state.store.mark_message_delivered(msg["message_id"])
+    if pending:
+        logger.info("  Flushed %d pending messages to '%s' via WebSocket", len(pending), agent.name)
+
+    # Listen loop
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "")
+
+            if msg_type == "ping":
+                await websocket.send_json({
+                    "type": "pong",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                })
+            elif msg_type == "ack":
+                message_id = data.get("message_id")
+                if message_id:
+                    state.store.mark_message_delivered(message_id)
+            elif msg_type == "tool_result":
+                request_id = data.get("request_id")
+                if request_id:
+                    state.ws_manager.resolve_pending(request_id, data.get("result", {}))
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "detail": f"Unknown message type: {msg_type}",
+                })
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning("WebSocket error for '%s': %s", agent.name, exc)
+    finally:
+        await state.ws_manager.disconnect(agent.did_str)
+        if PROMETHEUS_AVAILABLE:
+            WEBSOCKET_CONNECTIONS.dec()
+        logger.info("WebSocket DISCONNECTED: '%s' (%s)", agent.name, agent.did_str)
 
 
 # -- Admin ------------------------------------------------------------------

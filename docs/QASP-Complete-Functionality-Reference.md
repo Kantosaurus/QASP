@@ -1524,3 +1524,354 @@ The `protocol/events.py` module defines 50+ typed event classes covering all pro
 - **Alert events**: `AlertReceived`
 
 All events inherit from the base `Event` class and carry a timestamp. This enables protocol-level observability, logging, and integration with monitoring systems.
+
+---
+
+# 17. Conversational Messaging
+
+QASP provides a conversational messaging layer that enables agents to communicate using natural language rather than structured JSON payloads. This section describes the design philosophy, message lifecycle, NLP convenience API, and bilateral conversation logging.
+
+## 17.1. Design Philosophy
+
+Agent-to-agent messaging in QASP is modeled after human conversation, not machine-to-machine RPC. The core principles are:
+
+**Natural language first.** Messages are plain-text sentences that read like something a person would say. Instead of `{"action": "request_weather", "params": {"city": "NYC"}}`, an agent says: *"Could you look up the weather data for New York City?"*
+
+**Intent as metadata, not routing.** Every message carries an optional `intent` tag (e.g., `question`, `greeting`, `request`). This is informational metadata for logging and observability — it never affects routing, authorization, or delivery. A message with `intent: "question"` follows the same code path as one with `intent: "statement"`.
+
+**Bilateral logging.** Both the sender and receiver maintain a local conversation log. The sender logs every outgoing message; the receiver logs every incoming message (whether received via WebSocket push, HTTP callback, or inbox polling). The server retains the authoritative record in its SQLite message store.
+
+**Additive, not breaking.** The NLP convenience methods (`say`, `ask`, `reply`, `greet`, `farewell`) are wrappers on top of the existing `send_message()` call. Existing code that uses `send_message()` directly continues to work unchanged.
+
+## 17.2. Conversation Lifecycle
+
+A typical conversational exchange follows this lifecycle:
+
+```
+Agent A                          Server                          Agent B
+   │                               │                               │
+   │── open_conversation() ───────>│                               │
+   │<── conversation_id + token ───│── conversation_opened ──────>│
+   │                               │                               │
+   │── greet() ──────────────────>│── message (WebSocket/cb) ───>│
+   │<── delivered ─────────────────│                               │
+   │                               │                               │
+   │── ask() ────────────────────>│── message ──────────────────>│
+   │<── delivered ─────────────────│                               │
+   │                               │                               │
+   │                               │<── reply() ───────────────────│
+   │<── message (WebSocket/cb) ────│── delivered ────────────────>│
+   │                               │                               │
+   │── say() ────────────────────>│── message ──────────────────>│
+   │                               │                               │
+   │── farewell() ───────────────>│── message + close ──────────>│
+   │<── conversation CLOSED ───────│                               │
+```
+
+**Opening**: Agent A calls `open_conversation(target_did, topic)`. The server creates a conversation record, issues a capability token with `ARM_MESSAGE` verb, and notifies Agent B via WebSocket or callback.
+
+**Exchange**: Agents send messages using NLP convenience methods. Each message is stored in the server's database, delivered via the 3-tier system (WebSocket > callback > inbox polling), and auto-logged on both sides.
+
+**Closing**: Either agent calls `farewell()` (which sends a farewell message and closes the conversation) or `close_conversation()` directly.
+
+## 17.3. Natural Language Message Format
+
+### Content
+
+Messages use `content_type: "text/plain"` by default. Content is always a human-readable string:
+
+| Instead of this... | ...agents say this |
+|--------------------|--------------------|
+| `{"action": "get_data", "type": "weather"}` | "Could you pull the latest weather data for me?" |
+| `{"status": "ok", "result": 42}` | "Sure, the answer is 42." |
+| `{"error": "not_found"}` | "I couldn't find what you're looking for, sorry." |
+| `{"ack": true}` | "Got it, thanks!" |
+
+### Intent Classification
+
+Every message carries an optional `intent` field. The client auto-classifies intent using a rule-based classifier (no ML dependencies required):
+
+| Intent | Detection Rule | Example |
+|--------|---------------|---------|
+| `question` | Ends with `?` | "What's the current temperature?" |
+| `greeting` | Starts with greeting words (hi, hello, hey, etc.) | "Hello! How are you doing?" |
+| `farewell` | Contains farewell words (goodbye, bye, see you, etc.) | "Thanks for the help, goodbye!" |
+| `request` | Contains request phrases (could you, please, can you, etc.) | "Could you send me the report?" |
+| `response` | Starts with response words (sure, yes, no, okay, etc.) | "Sure, here's what I found." |
+| `notification` | Contains notification words (alert, update, fyi, etc.) | "FYI, the deployment completed." |
+| `statement` | Default (none of the above) | "The server is running on port 8080." |
+
+Intent is stored in the `messages` database table and included in relay payloads, but never affects delivery or authorization.
+
+## 17.4. Bilateral Conversation Logging
+
+### Client-Side: ConversationLog
+
+The `QASPClient` maintains an in-memory `ConversationLog` for each active conversation. Logs are created automatically when a conversation is opened (by either side) and populated as messages are sent and received.
+
+```python
+class ConversationLog:
+    conversation_id: str     # Conversation identifier
+    agent_name: str          # This agent's name
+    partner_name: str        # Other agent's name
+    partner_did: str         # Other agent's DID
+    topic: str               # Conversation topic
+    entries: list[LogEntry]  # Ordered list of sent/received messages
+```
+
+Each `LogEntry` records:
+- **direction**: `SENT` or `RECEIVED`
+- **sender_name**: Who sent the message
+- **content**: The natural language text
+- **intent**: Classified intent tag
+- **timestamp**: ISO-8601 timestamp
+- **message_id**: Unique message identifier
+- **reply_to**: Optional reference to a previous message
+
+**Auto-logging points:**
+- `send_message()` / `say()` / `ask()` / `reply()` / `greet()` — logs outgoing
+- WebSocket `on_message` — logs incoming before user callback fires
+- `get_inbox()` — logs each polled message as received
+- `conversation_opened` WebSocket event — creates a new ConversationLog
+
+### Server-Side: SQLite Message Store
+
+The server stores every message in its `messages` table with the `intent` field:
+
+```sql
+CREATE TABLE messages (
+    message_id       TEXT PRIMARY KEY,
+    conversation_id  TEXT NOT NULL,
+    sender_did       TEXT NOT NULL,
+    recipient_did    TEXT NOT NULL,
+    content_type     TEXT NOT NULL DEFAULT 'text/plain',
+    content          TEXT NOT NULL,
+    intent           TEXT DEFAULT NULL,
+    reply_to         TEXT,
+    created_at       TEXT NOT NULL,
+    delivered        INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+);
+```
+
+### Transcript Access
+
+Both sides can produce human-readable transcripts:
+
+**Local transcript** (client-side, from ConversationLog):
+```python
+transcript = client.get_transcript(conversation_id)
+print(transcript)
+```
+
+Output:
+```
+Topic: Weather data request
+Participants: WeatherBot, DataAgent
+
+  >> [2026-04-03T14:00:01Z] WeatherBot [greeting]: Hello from WeatherBot! How can I help you today?
+  << [2026-04-03T14:00:03Z] DataAgent [question]: Could you look up the forecast for NYC?
+  >> [2026-04-03T14:00:05Z] WeatherBot [response]: Sure, NYC forecast: sunny, high of 72F.
+  << [2026-04-03T14:00:07Z] DataAgent [statement]: Great, thanks for the info.
+  >> [2026-04-03T14:00:09Z] WeatherBot [farewell]: Thanks for the conversation! Goodbye from WeatherBot.
+```
+
+**Server transcript** (authoritative record):
+```python
+result = client.get_server_transcript(conversation_id)
+print(result["transcript"])
+```
+
+The server transcript endpoint (`GET /conversations/{id}/transcript`) returns the same conversation formatted from the authoritative database, including agent names resolved from their DIDs.
+
+## 17.5. NLP Convenience API
+
+The `QASPClient` provides these conversational methods on top of `send_message()`:
+
+### say(conversation_id, message, token, reply_to=None)
+
+Send a general natural-language message. Intent is auto-classified.
+
+```python
+client.say(conv_id, "The deployment finished successfully.", token)
+```
+
+### ask(conversation_id, question, token, reply_to=None)
+
+Ask a question. Appends `?` if missing. Intent is set to `question`.
+
+```python
+client.ask(conv_id, "What's the current CPU usage", token)
+# Sends: "What's the current CPU usage?"
+```
+
+### reply(conversation_id, message, token, to_message_id)
+
+Reply to a specific message. Creates a threaded reply via the `reply_to` field.
+
+```python
+client.reply(conv_id, "It's at 42% right now.", token, msg_id)
+```
+
+### greet(conversation_id, token, greeting="")
+
+Send a greeting. Uses a default if no custom text is provided.
+
+```python
+client.greet(conv_id, token)
+# Sends: "Hello from MyAgent! How can I help you today?"
+
+client.greet(conv_id, token, "Hey there! Ready to get started?")
+```
+
+### farewell(conversation_id, token, message="")
+
+Send a farewell message and close the conversation in one call.
+
+```python
+result = client.farewell(conv_id, token)
+# Sends farewell message, then closes the conversation
+# Returns: {"conversation_id": ..., "status": "CLOSED", ...}
+```
+
+### get_transcript(conversation_id)
+
+Get the formatted local transcript.
+
+```python
+print(client.get_transcript(conv_id))
+```
+
+### get_server_transcript(conversation_id)
+
+Fetch the authoritative transcript from the server.
+
+```python
+result = client.get_server_transcript(conv_id)
+print(result["transcript"])
+```
+
+## 17.6. Example: Two-Agent Conversation
+
+This example shows two agents having a natural conversation, with transcripts from both perspectives.
+
+```python
+from scripts.qasp_client import QASPClient
+
+# Set up two agents
+alice = QASPClient("http://localhost:8080")
+alice.register("Alice", [{"name": "research", "description": "Research assistant"}])
+
+bob = QASPClient("http://localhost:8080")
+bob.register("Bob", [{"name": "data", "description": "Data provider"}])
+
+# Alice opens a conversation with Bob
+conv = alice.open_conversation(bob._did, topic="Q3 revenue analysis")
+token = conv["token"]
+
+# Alice greets Bob
+alice.greet(conv["conversation_id"], token)
+
+# Alice asks a question
+alice.ask(conv["conversation_id"], "Do you have the Q3 revenue numbers ready", token)
+
+# Bob gets the messages from his inbox and responds
+inbox = bob.get_inbox()
+bob_token = bob.request_message_token(alice._did)["token"]
+msg_id = inbox["messages"][-1]["message_id"]
+
+bob.reply(
+    conv["conversation_id"],
+    "Yes, Q3 revenue was $4.2M, up 15% from Q2.",
+    bob_token,
+    msg_id,
+)
+
+bob.say(
+    conv["conversation_id"],
+    "I can also pull the breakdown by region if you need it.",
+    bob_token,
+)
+
+# Alice wraps up
+alice.say(conv["conversation_id"], "That would be great, please send it over.", token)
+alice.farewell(conv["conversation_id"], token, "Thanks Bob, this is exactly what I needed!")
+
+# Both sides can view their transcripts
+print("=== Alice's transcript ===")
+print(alice.get_transcript(conv["conversation_id"]))
+
+print("\n=== Bob's transcript ===")
+print(bob.get_transcript(conv["conversation_id"]))
+```
+
+**Alice's local transcript:**
+```
+Topic: Q3 revenue analysis
+Participants: Alice, Bob
+
+  >> [2026-04-03T14:00:01Z] Alice [greeting]: Hello from Alice! How can I help you today?
+  >> [2026-04-03T14:00:02Z] Alice [question]: Do you have the Q3 revenue numbers ready?
+  >> [2026-04-03T14:00:06Z] Alice [request]: That would be great, please send it over.
+  >> [2026-04-03T14:00:07Z] Alice [farewell]: Thanks Bob, this is exactly what I needed!
+```
+
+**Bob's local transcript** (populated via `get_inbox()` auto-logging):
+```
+Topic: Q3 revenue analysis
+Participants: Bob, Alice
+
+  << [2026-04-03T14:00:01Z] Alice [greeting]: Hello from Alice! How can I help you today?
+  << [2026-04-03T14:00:02Z] Alice [question]: Do you have the Q3 revenue numbers ready?
+  >> [2026-04-03T14:00:04Z] Bob [response]: Yes, Q3 revenue was $4.2M, up 15% from Q2.
+  >> [2026-04-03T14:00:05Z] Bob [statement]: I can also pull the breakdown by region if you need it.
+```
+
+**Server transcript** (authoritative, shows all messages from both sides):
+```
+Topic: Q3 revenue analysis
+
+[2026-04-03T14:00:01Z] Alice [greeting]: Hello from Alice! How can I help you today?
+[2026-04-03T14:00:02Z] Alice [question]: Do you have the Q3 revenue numbers ready?
+[2026-04-03T14:00:04Z] Bob [response]: Yes, Q3 revenue was $4.2M, up 15% from Q2.
+[2026-04-03T14:00:05Z] Bob [statement]: I can also pull the breakdown by region if you need it.
+[2026-04-03T14:00:06Z] Alice [request]: That would be great, please send it over.
+[2026-04-03T14:00:07Z] Alice [farewell]: Thanks Bob, this is exactly what I needed!
+```
+
+## 17.7. WebSocket Real-Time Logging
+
+When agents use the `QASPWebSocketListener` for real-time communication, conversation logging happens automatically:
+
+**Incoming messages**: When a `message` event arrives via WebSocket, the listener:
+1. Looks up (or creates) the `ConversationLog` for the conversation
+2. Logs the message as `RECEIVED` with sender name, content, intent, and timestamp
+3. Fires the user's `on_message` callback
+
+**New conversations**: When a `conversation_opened` event arrives, the listener:
+1. Creates a new `ConversationLog` with the initiator's name and DID
+2. Fires the user's `on_conversation` callback
+
+This means agents using WebSocket listeners get a complete conversation log without any extra code — all incoming messages are logged before callbacks fire, ensuring the log is always up to date.
+
+```python
+# WebSocket listener auto-logs everything
+listener = client.create_websocket_listener(
+    on_message=lambda msg: print(f"New message from {msg['sender_name']}"),
+    on_conversation=lambda conv: print(f"New conversation: {conv['topic']}"),
+)
+
+# After messages arrive, the transcript is already populated
+print(client.get_transcript(some_conversation_id))
+```
+
+### Messaging Events
+
+The protocol events system (Section 16) includes messaging-specific events that are emitted alongside conversation logging:
+
+- `MessageSent` — fired when a message is sent
+- `MessageReceived` — fired when a message is received
+- `MessageDelivered` — fired when delivery is confirmed
+- `MessageRejected` — fired if a message is rejected (with reason)
+- `ConversationOpened` — fired when a new conversation is created
+- `ConversationClosed` — fired when a conversation is closed (with message count)
