@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 
 __all__ = [
+    "AgentMessage",
+    "AgentMessageAck",
     "Alert",
     "ApplicationData",
     "ChannelClose",
@@ -107,6 +109,10 @@ class MessageType(IntEnum):
     # OCSP
     OCSP_REQUEST = 0x1B
     OCSP_RESPONSE = 0x1C
+
+    # Agent-to-agent messaging
+    AGENT_MESSAGE = 0x1D
+    AGENT_MESSAGE_ACK = 0x1E
 
 
 @dataclass(frozen=True)
@@ -828,3 +834,60 @@ class OCSPResponseMessage(Message):
     signature: bytes = b""
     revocation_reason: int | None = None
     revocation_time: int | None = None
+
+
+# =============================================================================
+# Agent-to-Agent Messaging (0x1D-0x1E)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class AgentMessage(Message):
+    """Agent-to-agent message (0x1D).
+
+    Carries a free-form message from one agent to another within
+    a conversation thread, enabling conversational interactions
+    beyond tool calls.
+
+    Attributes:
+        message_id: Unique message identifier (16 bytes).
+        conversation_id: Conversation/thread identifier (16 bytes).
+        sender_did: DID of the sending agent.
+        recipient_did: DID of the recipient agent.
+        content_type: MIME type of the content (default "text/plain").
+        content: Message content (bytes, typically UTF-8 text).
+        reply_to: Optional message_id this is replying to.
+        timestamp: Unix timestamp when the message was created.
+        metadata: Optional CBOR-encoded metadata dict.
+    """
+
+    message_type: MessageType = field(default=MessageType.AGENT_MESSAGE, init=False)
+    message_id: bytes = b""
+    conversation_id: bytes = b""
+    sender_did: str = ""
+    recipient_did: str = ""
+    content_type: str = "text/plain"
+    content: bytes = b""
+    reply_to: bytes = b""
+    timestamp: int = 0
+    metadata: bytes = b""
+
+
+@dataclass(frozen=True)
+class AgentMessageAck(Message):
+    """Agent message delivery acknowledgment (0x1E).
+
+    Confirms receipt or rejection of an agent-to-agent message.
+
+    Attributes:
+        message_id: ID of the acknowledged message.
+        conversation_id: Conversation the message belongs to.
+        status: Delivery status (0=delivered, 1=read, 2=rejected).
+        timestamp: Unix timestamp of the acknowledgment.
+    """
+
+    message_type: MessageType = field(default=MessageType.AGENT_MESSAGE_ACK, init=False)
+    message_id: bytes = b""
+    conversation_id: bytes = b""
+    status: int = 0
+    timestamp: int = 0

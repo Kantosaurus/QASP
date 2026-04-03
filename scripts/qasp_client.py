@@ -252,3 +252,152 @@ class QASPClient:
             Full dispute record.
         """
         return self._request("GET", f"/disputes/{dispute_id}")
+
+    # -- messaging ----------------------------------------------------------
+
+    def open_conversation(
+        self,
+        target_did: str,
+        topic: str = "",
+    ) -> dict[str, Any]:
+        """Open a conversation with another agent.
+
+        Args:
+            target_did: DID of the agent to converse with.
+            topic: Optional conversation topic.
+
+        Returns:
+            Dict with conversation_id, token, token_id, resource_uri,
+            participants, created_at.
+        """
+        return self._request("POST", "/conversations/open", json={
+            "target_did": target_did,
+            "topic": topic,
+        })
+
+    def send_message(
+        self,
+        conversation_id: str,
+        content: str,
+        token: str,
+        content_type: str = "text/plain",
+        reply_to: str | None = None,
+    ) -> dict[str, Any]:
+        """Send a message in a conversation.
+
+        Args:
+            conversation_id: The conversation to send in.
+            content: Message content.
+            token: Base64-encoded QASP capability token.
+            content_type: MIME type of content.
+            reply_to: Optional message_id to reply to.
+
+        Returns:
+            Dict with message_id, conversation_id, delivered, metering,
+            receipt_id.
+        """
+        payload: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "content": content,
+            "token": token,
+            "content_type": content_type,
+        }
+        if reply_to:
+            payload["reply_to"] = reply_to
+        return self._request("POST", "/messages/send", json=payload)
+
+    def list_conversations(
+        self,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List conversations this agent participates in.
+
+        Args:
+            status: Filter by status ("ACTIVE" or "CLOSED").
+
+        Returns:
+            List of conversation info dicts.
+        """
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        return self._request("GET", "/conversations", params=params)
+
+    def get_messages(
+        self,
+        conversation_id: str,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Get messages in a conversation.
+
+        Args:
+            conversation_id: The conversation to query.
+            since: ISO timestamp to filter messages after.
+            limit: Maximum number of messages to return.
+
+        Returns:
+            Dict with conversation_id, messages list, total.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if since:
+            params["since"] = since
+        return self._request(
+            "GET", f"/conversations/{conversation_id}/messages", params=params,
+        )
+
+    def close_conversation(self, conversation_id: str) -> dict[str, Any]:
+        """Close a conversation.
+
+        Args:
+            conversation_id: The conversation to close.
+
+        Returns:
+            Dict with conversation_id, status, closed_at, closed_by.
+        """
+        return self._request(
+            "POST", f"/conversations/{conversation_id}/close",
+        )
+
+    def get_inbox(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Poll for undelivered messages.
+
+        Args:
+            limit: Maximum number of messages to return.
+
+        Returns:
+            Dict with messages list and total.
+        """
+        return self._request("GET", "/messages/inbox", params={"limit": limit})
+
+    def acknowledge_message(self, message_id: str) -> dict[str, Any]:
+        """Acknowledge receipt of a message.
+
+        Args:
+            message_id: The message to acknowledge.
+
+        Returns:
+            Confirmation dict.
+        """
+        return self._request("POST", "/messages/acknowledge", json={
+            "message_id": message_id,
+        })
+
+    def request_message_token(
+        self,
+        target_did: str,
+    ) -> dict[str, Any]:
+        """Request a capability token for messaging another agent.
+
+        Convenience method — calls request_token with tool_name="_messages"
+        and verbs=["message"].
+
+        Args:
+            target_did: DID of the target agent.
+
+        Returns:
+            Dict with token (base64), token_id, resource_uri, expires_at.
+        """
+        return self.request_token(
+            target_did, "_messages", verbs=["message"],
+        )

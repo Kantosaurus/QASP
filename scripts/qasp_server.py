@@ -51,6 +51,7 @@ from qasp.identity.did import DID, DIDRegistry, create_did
 from qasp.protocol.arm import uri_matches
 from qasp.protocol.capability import (
     ARM_EXEC,
+    ARM_MESSAGE,
     CapabilityToken,
     Constraints,
     create_token,
@@ -100,6 +101,28 @@ CREATE TABLE IF NOT EXISTS disputes (
     status          TEXT NOT NULL,
     opened_at       TEXT NOT NULL,
     verdict         TEXT
+);
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id  TEXT PRIMARY KEY,
+    initiator_did    TEXT NOT NULL,
+    participant_did  TEXT NOT NULL,
+    topic            TEXT DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at       TEXT NOT NULL,
+    closed_at        TEXT,
+    message_count    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS messages (
+    message_id       TEXT PRIMARY KEY,
+    conversation_id  TEXT NOT NULL,
+    sender_did       TEXT NOT NULL,
+    recipient_did    TEXT NOT NULL,
+    content_type     TEXT NOT NULL DEFAULT 'text/plain',
+    content          TEXT NOT NULL,
+    reply_to         TEXT,
+    created_at       TEXT NOT NULL,
+    delivered        INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
 );
 """
 
@@ -242,6 +265,118 @@ class PersistentStore:
             results.append(d)
         return results
 
+    # -- conversations --
+
+    def insert_conversation(self, conv: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO conversations "
+                "(conversation_id, initiator_did, participant_did, topic, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    conv["conversation_id"], conv["initiator_did"],
+                    conv["participant_did"], conv.get("topic", ""),
+                    conv.get("status", "ACTIVE"), conv["created_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def query_conversations(
+        self, agent_did: str, status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["(initiator_did = ? OR participant_did = ?)"]
+        params: list[Any] = [agent_did, agent_did]
+        if status:
+            clauses.append("status = ?")
+            params.append(status.upper())
+        sql = (
+            "SELECT * FROM conversations WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at DESC"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def close_conversation(self, conversation_id: str, closed_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE conversations SET status = 'CLOSED', closed_at = ? "
+                "WHERE conversation_id = ?",
+                (closed_at, conversation_id),
+            )
+            self._conn.commit()
+
+    def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    # -- messages --
+
+    def insert_message(self, msg: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO messages "
+                "(message_id, conversation_id, sender_did, recipient_did, "
+                "content_type, content, reply_to, created_at, delivered) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    msg["message_id"], msg["conversation_id"],
+                    msg["sender_did"], msg["recipient_did"],
+                    msg.get("content_type", "text/plain"), msg["content"],
+                    msg.get("reply_to"), msg["created_at"],
+                    1 if msg.get("delivered") else 0,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE conversations SET message_count = message_count + 1 "
+                "WHERE conversation_id = ?",
+                (msg["conversation_id"],),
+            )
+            self._conn.commit()
+
+    def mark_message_delivered(self, message_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE messages SET delivered = 1 WHERE message_id = ?",
+                (message_id,),
+            )
+            self._conn.commit()
+
+    def query_messages(
+        self,
+        conversation_id: str,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses = ["conversation_id = ?"]
+        params: list[Any] = [conversation_id]
+        if since:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        params.append(limit)
+        sql = (
+            "SELECT * FROM messages WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at ASC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_inbox(self, agent_did: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM messages WHERE recipient_did = ? AND delivered = 0 "
+                "ORDER BY created_at ASC LIMIT ?",
+                (agent_did, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # -- receipts (cross-agent query) --
 
     def query_all_metering(
@@ -301,6 +436,23 @@ class DisputeOpenRequest(BaseModel):
     respondent_did: str
     type: str  # "overcharge", "service_failure", etc.
     description: str = ""
+
+
+class ConversationOpenRequest(BaseModel):
+    target_did: str
+    topic: str = ""
+
+
+class MessageSendRequest(BaseModel):
+    conversation_id: str
+    content: str
+    content_type: str = "text/plain"
+    reply_to: str | None = None
+    token: str  # base64 capability token
+
+
+class MessageAckRequest(BaseModel):
+    message_id: str
 
 
 # ============================================================================
@@ -473,6 +625,16 @@ if PROMETHEUS_AVAILABLE:
         "Total metering cost (credits)",
         registry=METRICS_REGISTRY,
     )
+    MESSAGES_RELAYED = Counter(
+        "qasp_messages_relayed_total",
+        "Total agent-to-agent messages relayed",
+        registry=METRICS_REGISTRY,
+    )
+    CONVERSATIONS_OPENED = Counter(
+        "qasp_conversations_opened_total",
+        "Total conversations opened",
+        registry=METRICS_REGISTRY,
+    )
     HTTP_REQUEST_DURATION = Histogram(
         "qasp_http_request_duration_seconds",
         "HTTP request duration in seconds",
@@ -522,6 +684,7 @@ def root():
             "Bayesian trust scoring",
             "Dispute resolution",
             "Tool call relay with metering",
+            "Agent-to-agent messaging with conversations",
         ],
     }
 
@@ -596,6 +759,16 @@ def register(body: RegisterRequest):
             "resource_uri": resource_uri,
         })
         logger.info("  >> Tool '%s' -> ARM URI: %s", t.name, resource_uri)
+
+    # Virtual messaging tool — every agent can receive messages
+    msg_resource_uri = f"qasp://agents/{did_short}/messages"
+    tools.append({
+        "name": "_messages",
+        "description": "Agent-to-agent messaging",
+        "input_schema": {"type": "object"},
+        "resource_uri": msg_resource_uri,
+    })
+    logger.info("  >> Virtual tool '_messages' -> ARM URI: %s", msg_resource_uri)
 
     api_key = uuid.uuid4().hex
     agent = AgentRecord(
@@ -1020,6 +1193,371 @@ def get_dispute(dispute_id: str):
     return dispute
 
 
+# -- Token verification helper ----------------------------------------------
+
+
+def _verify_capability_token(
+    token_b64: str,
+    required_uri: str,
+    required_verb: str,
+) -> CapabilityToken:
+    """Decode and verify a capability token (reusable 7-step pipeline).
+
+    Returns the verified CapabilityToken on success, raises HTTPException on failure.
+    """
+    # Decode
+    try:
+        token_cbor = base64.b64decode(token_b64)
+        token = CapabilityToken.from_cbor(token_cbor)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid token encoding: {exc}") from exc
+
+    # 1-3) Signature, expiry, revocation
+    try:
+        verify_token(
+            token=token,
+            issuer_public_key=state.public_key,
+            check_expiry=True,
+            crl=state.crl,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    # 4) ARM URI scope check
+    if not uri_matches(token.resource_uri, required_uri):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Resource URI mismatch: token grants '{token.resource_uri}', requires '{required_uri}'",
+        )
+
+    # 5) Verb check
+    if required_verb not in token.verbs:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Token missing '{required_verb}' verb",
+        )
+
+    # 6) Rate limiting
+    rate_limit = token.constraints.rate_limit or 30
+    rate_period = token.constraints.rate_period_seconds or 60
+    limiter = state.rate_limiters.get_or_create(
+        token_id=token.token_id,
+        rate_limit=rate_limit,
+        rate_period_seconds=rate_period,
+    )
+    if not limiter.consume():
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded ({rate_limit} per {rate_period}s)",
+        )
+
+    return token
+
+
+# -- Messaging --------------------------------------------------------------
+
+MIN_MESSAGE_TRUST_SCORE = 0.3
+
+
+@app.post("/conversations/open")
+def open_conversation(body: ConversationOpenRequest, x_api_key: str | None = Header(None)):
+    caller = state.resolve_agent(_api_key(x_api_key))
+    target = state.resolve_target(body.target_did)
+
+    logger.info("--- POST /conversations/open ---")
+    logger.info("  Initiator: '%s' (%s)", caller.name, caller.did_str)
+    logger.info("  Target: '%s' (%s)", target.name, target.did_str)
+    logger.info("  Topic: %s", body.topic or "(none)")
+
+    # Trust gate
+    caller_trust = state.compute_trust(caller.did_str)
+    if caller_trust["score"] < MIN_MESSAGE_TRUST_SCORE:
+        logger.warning("  DENIED: Caller trust %.4f < %.2f", caller_trust["score"], MIN_MESSAGE_TRUST_SCORE)
+        raise HTTPException(
+            status_code=403,
+            detail=f"Sender trust score {caller_trust['score']:.4f} below messaging threshold {MIN_MESSAGE_TRUST_SCORE}",
+        )
+
+    # Create conversation
+    conversation_id = uuid.uuid4().hex
+    now = datetime.now(UTC).isoformat()
+    conv = {
+        "conversation_id": conversation_id,
+        "initiator_did": caller.did_str,
+        "participant_did": target.did_str,
+        "topic": body.topic,
+        "status": "ACTIVE",
+        "created_at": now,
+    }
+    state.store.insert_conversation(conv)
+
+    # Issue capability token for caller -> target messaging
+    target_short = target.did.identifier[:12]
+    resource_uri = f"qasp://agents/{target_short}/messages/{conversation_id}"
+    token = create_token(
+        issuer_did=state.did,
+        issuer_secret_key=state.secret_key,
+        subject_did=caller.did,
+        resource_uri=resource_uri,
+        verbs={ARM_MESSAGE},
+        audience_did=target.did,
+        constraints=Constraints(rate_limit=30, rate_period_seconds=60),
+        validity_seconds=3600,
+    )
+    state.crl.register_token(token)
+    tid_hex = token.token_id.hex()
+    state.tokens[tid_hex] = token
+    caller.tokens_issued[tid_hex] = token
+    state.store.insert_token_event(tid_hex, "issued", resource_uri)
+    token_cbor = token.to_cbor_with_signature()
+
+    if PROMETHEUS_AVAILABLE:
+        CONVERSATIONS_OPENED.inc()
+        TOKENS_ISSUED.inc()
+
+    # Attempt to notify target via callback
+    if target.callback_url:
+        try:
+            with httpx.Client(timeout=10) as client:
+                client.post(
+                    f"{target.callback_url.rstrip('/')}/conversations/new",
+                    json={
+                        "conversation_id": conversation_id,
+                        "initiator_did": caller.did_str,
+                        "initiator_name": caller.name,
+                        "topic": body.topic,
+                    },
+                    headers={"X-QASP-Caller-DID": caller.did_str},
+                )
+            logger.info("  >> Target notified via callback")
+        except Exception as exc:
+            logger.warning("  >> Target notification failed: %s", exc)
+
+    logger.info("  >> Conversation opened: id=%s", conversation_id)
+
+    return {
+        "conversation_id": conversation_id,
+        "token": base64.b64encode(token_cbor).decode(),
+        "token_id": tid_hex,
+        "resource_uri": resource_uri,
+        "participants": [caller.did_str, target.did_str],
+        "created_at": now,
+    }
+
+
+@app.post("/messages/send")
+async def send_message(body: MessageSendRequest, x_api_key: str | None = Header(None)):
+    caller = state.resolve_agent(_api_key(x_api_key))
+
+    logger.info("--- POST /messages/send ---")
+    logger.info("  Sender: '%s' (%s)", caller.name, caller.did_str)
+    logger.info("  Conversation: %s", body.conversation_id)
+
+    # Validate conversation exists and caller is a participant
+    conv = state.store.get_conversation(body.conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv["status"] != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Conversation is closed")
+    if caller.did_str not in (conv["initiator_did"], conv["participant_did"]):
+        raise HTTPException(status_code=403, detail="Not a participant in this conversation")
+
+    # Determine recipient
+    recipient_did = conv["participant_did"] if caller.did_str == conv["initiator_did"] else conv["initiator_did"]
+    target = state.resolve_target(recipient_did)
+
+    # Build the expected resource URI for token verification
+    target_short = target.did.identifier[:12]
+    expected_uri = f"qasp://agents/{target_short}/messages/{body.conversation_id}"
+
+    # Verify token (7-step pipeline)
+    logger.info("  Verifying capability token...")
+    _verify_capability_token(body.token, expected_uri, ARM_MESSAGE)
+    logger.info("  >> Token verified")
+
+    # Trust gate
+    caller_trust = state.compute_trust(caller.did_str)
+    if caller_trust["score"] < MIN_MESSAGE_TRUST_SCORE:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Sender trust {caller_trust['score']:.4f} below threshold {MIN_MESSAGE_TRUST_SCORE}",
+        )
+
+    # Content size limit (64KB)
+    if len(body.content.encode("utf-8")) > 65536:
+        raise HTTPException(status_code=400, detail="Message content exceeds 64KB limit")
+
+    # Store message
+    message_id = uuid.uuid4().hex
+    now = datetime.now(UTC).isoformat()
+    delivered = False
+
+    msg_record = {
+        "message_id": message_id,
+        "conversation_id": body.conversation_id,
+        "sender_did": caller.did_str,
+        "recipient_did": recipient_did,
+        "content_type": body.content_type,
+        "content": body.content,
+        "reply_to": body.reply_to,
+        "created_at": now,
+        "delivered": False,
+    }
+
+    # Attempt callback relay
+    if target.callback_url:
+        relay_url = f"{target.callback_url.rstrip('/')}/messages/{body.conversation_id}"
+        logger.info("  Relaying to callback: %s", relay_url)
+        t0 = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    relay_url,
+                    json={
+                        "message_id": message_id,
+                        "conversation_id": body.conversation_id,
+                        "sender_did": caller.did_str,
+                        "sender_name": caller.name,
+                        "content_type": body.content_type,
+                        "content": body.content,
+                        "reply_to": body.reply_to,
+                        "created_at": now,
+                    },
+                    headers={
+                        "X-QASP-Caller-DID": caller.did_str,
+                        "X-QASP-Message-ID": message_id,
+                    },
+                )
+                if resp.status_code < 400:
+                    delivered = True
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info("  >> Relay %s (%.0fms)", "delivered" if delivered else "failed", elapsed_ms)
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.warning("  >> Relay FAILED (%.0fms): %s", elapsed_ms, exc)
+    else:
+        logger.info("  No callback_url — message queued for inbox polling")
+
+    msg_record["delivered"] = delivered
+    state.store.insert_message(msg_record)
+
+    # Metering (5 credits per message, cheaper than tool calls at 10)
+    receipt_id = uuid.uuid4().hex
+    metering = {"units": 1, "cost": 5, "currency": "credits"}
+    metering_record = {
+        "receipt_id": receipt_id,
+        "tool": "_messages",
+        "target": recipient_did,
+        "timestamp": now,
+        **metering,
+    }
+    caller.metering.append(metering_record)
+    state.store.insert_metering(caller.did_str, metering_record)
+
+    if PROMETHEUS_AVAILABLE:
+        MESSAGES_RELAYED.inc()
+        METERING_UNITS.inc(metering["units"])
+        METERING_COST.inc(metering["cost"])
+
+    # Trust update
+    try:
+        state.trust_registry.update_reputation(caller.did_str, success=True)
+    except Exception:
+        pass
+
+    logger.info("  >> Message sent: id=%s  delivered=%s  cost=%d credits", message_id[:12] + "...", delivered, metering["cost"])
+
+    return {
+        "message_id": message_id,
+        "conversation_id": body.conversation_id,
+        "delivered": delivered,
+        "metering": metering,
+        "receipt_id": receipt_id,
+    }
+
+
+@app.get("/conversations")
+def list_conversations(
+    status: str | None = Query(None),
+    x_api_key: str | None = Header(None),
+):
+    caller = state.resolve_agent(_api_key(x_api_key))
+    logger.info("--- GET /conversations ---")
+    convs = state.store.query_conversations(caller.did_str, status=status)
+    logger.info("  Returning %d conversations for '%s'", len(convs), caller.name)
+    return convs
+
+
+@app.get("/conversations/{conversation_id}/messages")
+def get_conversation_messages(
+    conversation_id: str,
+    since: str | None = Query(None),
+    limit: int = Query(50),
+    x_api_key: str | None = Header(None),
+):
+    caller = state.resolve_agent(_api_key(x_api_key))
+
+    # Verify caller is a participant
+    conv = state.store.get_conversation(conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if caller.did_str not in (conv["initiator_did"], conv["participant_did"]):
+        raise HTTPException(status_code=403, detail="Not a participant in this conversation")
+
+    messages = state.store.query_messages(conversation_id, since=since, limit=limit)
+    return {"conversation_id": conversation_id, "messages": messages, "total": len(messages)}
+
+
+@app.post("/conversations/{conversation_id}/close")
+def close_conversation(conversation_id: str, x_api_key: str | None = Header(None)):
+    caller = state.resolve_agent(_api_key(x_api_key))
+
+    conv = state.store.get_conversation(conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if caller.did_str not in (conv["initiator_did"], conv["participant_did"]):
+        raise HTTPException(status_code=403, detail="Not a participant in this conversation")
+    if conv["status"] == "CLOSED":
+        raise HTTPException(status_code=400, detail="Conversation already closed")
+
+    now = datetime.now(UTC).isoformat()
+    state.store.close_conversation(conversation_id, now)
+
+    logger.info("--- POST /conversations/%s/close ---", conversation_id[:12] + "...")
+    logger.info("  Closed by '%s' (%s)", caller.name, caller.did_str)
+
+    return {
+        "conversation_id": conversation_id,
+        "status": "CLOSED",
+        "closed_at": now,
+        "closed_by": caller.did_str,
+    }
+
+
+@app.get("/messages/inbox")
+def get_inbox(
+    limit: int = Query(50),
+    x_api_key: str | None = Header(None),
+):
+    caller = state.resolve_agent(_api_key(x_api_key))
+    logger.info("--- GET /messages/inbox ---")
+    messages = state.store.query_inbox(caller.did_str, limit=limit)
+    logger.info("  Returning %d pending messages for '%s'", len(messages), caller.name)
+    return {"messages": messages, "total": len(messages)}
+
+
+@app.post("/messages/acknowledge")
+def acknowledge_message(body: MessageAckRequest, x_api_key: str | None = Header(None)):
+    caller = state.resolve_agent(_api_key(x_api_key))
+
+    logger.info("--- POST /messages/acknowledge ---")
+    logger.info("  Agent: '%s' (%s)", caller.name, caller.did_str)
+    logger.info("  Message ID: %s", body.message_id)
+
+    state.store.mark_message_delivered(body.message_id)
+    return {"message_id": body.message_id, "acknowledged": True}
+
+
 # -- Admin ------------------------------------------------------------------
 
 
@@ -1173,6 +1711,7 @@ def main() -> None:
     print("  Crypto:  ML-DSA-65 (FIPS 204) post-quantum signatures")
     print("  Tokens:  CBOR-encoded, 1hr validity, 10 calls/60s limit")
     print("  Trust:   Bayesian scoring with anti-gaming caps")
+    print("  Messaging: Agent-to-agent conversations with inbox")
     print()
     print(f"  DB:       {args.db}")
     print(f"  Admin:    X-Admin-Key: {state.admin_api_key}")

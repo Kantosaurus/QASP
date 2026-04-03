@@ -20,6 +20,8 @@ __all__ = [
     "ChannelStateUpdated",
     "ConnectionClosed",
     "ConnectionError",
+    "ConversationClosed",
+    "ConversationOpened",
     "CrossDomainDelegationGranted",
     "CrossDomainDelegationRejected",
     "CrossDomainDelegationRequested",
@@ -36,6 +38,10 @@ __all__ = [
     "HandshakeFailed",
     "HandshakeInitiated",
     "HandshakeTimeout",
+    "MessageDelivered",
+    "MessageReceived",
+    "MessageRejected",
+    "MessageSent",
     "MeterAckSent",
     "MeterReportReceived",
     "OCSPRequestReceived",
@@ -836,3 +842,102 @@ class OCSPResponseGenerated(Event):
     token_id: bytes
     status: int
     cached: bool
+
+
+# =============================================================================
+# Agent-to-Agent Messaging Events
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class MessageSent(Event):
+    """An agent-to-agent message was sent.
+
+    Attributes:
+        message_id: Unique message identifier.
+        conversation_id: Conversation identifier.
+        sender_did: DID of the sender.
+        recipient_did: DID of the recipient.
+        content_length: Length of the message content in bytes.
+    """
+
+    message_id: str
+    conversation_id: str
+    sender_did: str
+    recipient_did: str
+    content_length: int
+
+
+@dataclass(frozen=True)
+class MessageReceived(Event):
+    """An agent-to-agent message was received.
+
+    Attributes:
+        message_id: Unique message identifier.
+        conversation_id: Conversation identifier.
+        sender_did: DID of the sender.
+        content_length: Length of the message content in bytes.
+    """
+
+    message_id: str
+    conversation_id: str
+    sender_did: str
+    content_length: int
+
+
+@dataclass(frozen=True)
+class MessageDelivered(Event):
+    """An agent message was confirmed delivered.
+
+    Attributes:
+        message_id: The delivered message's identifier.
+        conversation_id: Conversation identifier.
+    """
+
+    message_id: str
+    conversation_id: str
+
+
+@dataclass(frozen=True)
+class MessageRejected(Event):
+    """An agent message was rejected by the recipient.
+
+    Attributes:
+        message_id: The rejected message's identifier.
+        conversation_id: Conversation identifier.
+        reason: Rejection reason.
+    """
+
+    message_id: str
+    conversation_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ConversationOpened(Event):
+    """A new conversation thread was opened.
+
+    Attributes:
+        conversation_id: The new conversation's identifier.
+        initiator_did: DID of the agent that started the conversation.
+        participant_did: DID of the other agent.
+    """
+
+    conversation_id: str
+    initiator_did: str
+    participant_did: str
+
+
+@dataclass(frozen=True)
+class ConversationClosed(Event):
+    """A conversation was closed.
+
+    Attributes:
+        conversation_id: The closed conversation's identifier.
+        closed_by: DID of the agent that closed it.
+        message_count: Total messages exchanged.
+    """
+
+    conversation_id: str
+    closed_by: str
+    message_count: int

@@ -31,6 +31,7 @@ __all__ = [
     "ARM_EXEC",
     "ARM_READ",
     "ARM_REVOKE",
+    "ARM_MESSAGE",
     "ARM_VERBS",
     "ARM_WRITE",
     "AttenuationError",
@@ -83,9 +84,10 @@ ARM_DELEGATE = "delegate"
 ARM_CHARGE = "charge"
 ARM_ATTENUATE = "attenuate"
 ARM_REVOKE = "revoke"
+ARM_MESSAGE = "message"
 ARM_VERBS: frozenset[str] = frozenset({
     ARM_READ, ARM_WRITE, ARM_EXEC, ARM_DELEGATE,
-    ARM_CHARGE, ARM_ATTENUATE, ARM_REVOKE,
+    ARM_CHARGE, ARM_ATTENUATE, ARM_REVOKE, ARM_MESSAGE,
 })
 
 
