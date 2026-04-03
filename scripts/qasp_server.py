@@ -455,6 +455,12 @@ class MessageAckRequest(BaseModel):
     message_id: str
 
 
+class AgentUpdateRequest(BaseModel):
+    name: str | None = None
+    tools: list[ToolDef] | None = None
+    callback_url: str | None = None
+
+
 # ============================================================================
 # Server state
 # ============================================================================
@@ -635,6 +641,11 @@ if PROMETHEUS_AVAILABLE:
         "Total conversations opened",
         registry=METRICS_REGISTRY,
     )
+    AGENTS_UPDATED = Counter(
+        "qasp_agents_updated_total",
+        "Total agent update operations",
+        registry=METRICS_REGISTRY,
+    )
     HTTP_REQUEST_DURATION = Histogram(
         "qasp_http_request_duration_seconds",
         "HTTP request duration in seconds",
@@ -794,6 +805,126 @@ def register(body: RegisterRequest):
         "did": did_str,
         "api_key": api_key,
         "public_key": base64.b64encode(pub).decode(),
+    }
+
+
+# -- Agent update -----------------------------------------------------------
+
+@app.put("/agents/update")
+def update_agent(body: AgentUpdateRequest, x_api_key: str | None = Header(None)):
+    agent = state.resolve_agent(_api_key(x_api_key))
+
+    logger.info("--- PUT /agents/update ---")
+    logger.info("  Agent: '%s' (%s)", agent.name, agent.did_str)
+    logger.info("  Fields to update: name=%s  tools=%s  callback_url=%s",
+                body.name is not None, body.tools is not None, body.callback_url is not None)
+
+    if body.name is None and body.tools is None and body.callback_url is None:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    changes: dict[str, Any] = {}
+
+    # -- Name --
+    if body.name is not None:
+        old_name = agent.name
+        agent.name = body.name
+        changes["name"] = {"old": old_name, "new": body.name}
+        logger.info("  >> Name updated: '%s' -> '%s'", old_name, body.name)
+
+    # -- Callback URL --
+    if body.callback_url is not None:
+        old_url = agent.callback_url
+        agent.callback_url = body.callback_url
+        changes["callback_url"] = {"old": old_url, "new": body.callback_url}
+        logger.info("  >> Callback URL updated: '%s' -> '%s'", old_url, body.callback_url)
+
+    # -- Tools --
+    revoked_count = 0
+    if body.tools is not None:
+        did_short = agent.did.identifier[:12]
+
+        # Filter out _messages if caller accidentally includes it
+        body_tools = [t for t in body.tools if t.name != "_messages"]
+
+        old_tool_names = {t["name"] for t in agent.tools if t["name"] != "_messages"}
+        new_tool_names = {t.name for t in body_tools}
+        removed_tools = old_tool_names - new_tool_names
+        added_tools = new_tool_names - old_tool_names
+
+        # Build new tool list with resource URIs
+        new_tools: list[dict[str, Any]] = []
+        for t in body_tools:
+            resource_uri = f"qasp://agents/{did_short}/tools/{t.name}"
+            new_tools.append({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema or {"type": "object"},
+                "resource_uri": resource_uri,
+            })
+            logger.info("  >> Tool '%s' -> ARM URI: %s", t.name, resource_uri)
+
+        # Always add virtual messaging tool
+        msg_resource_uri = f"qasp://agents/{did_short}/messages"
+        new_tools.append({
+            "name": "_messages",
+            "description": "Agent-to-agent messaging",
+            "input_schema": {"type": "object"},
+            "resource_uri": msg_resource_uri,
+        })
+
+        # Revoke tokens bound to removed tools
+        for tool_name in removed_tools:
+            removed_uri = f"qasp://agents/{did_short}/tools/{tool_name}"
+            logger.info("  >> Revoking tokens for removed tool '%s' (URI: %s)", tool_name, removed_uri)
+
+            tokens_to_revoke = [
+                (tid_hex, tok) for tid_hex, tok in state.tokens.items()
+                if tok.resource_uri == removed_uri
+            ]
+
+            for tid_hex, tok in tokens_to_revoke:
+                token_id_bytes = bytes.fromhex(tid_hex)
+                if state.crl.is_revoked(token_id_bytes):
+                    continue
+                try:
+                    entries = state.crl.revoke(
+                        token_id=token_id_bytes,
+                        reason=RevocationReason.PRIVILEGE_WITHDRAWN,
+                        urgency=RevocationUrgency.CRITICAL,
+                        revoker_did=str(state.did),
+                        revoker_secret_key=state.secret_key,
+                    )
+                    state.ocsp.invalidate(token_id_bytes)
+                    state.store.insert_token_event(tid_hex, "revoked", f"tool_removed:{tool_name}")
+                    revoked_count += len(entries)
+                    logger.info("    Revoked token %s... (%d entries incl. cascade)", tid_hex[:16], len(entries))
+                except Exception as exc:
+                    logger.warning("    Failed to revoke token %s...: %s", tid_hex[:16], exc)
+
+        agent.tools = new_tools
+        changes["tools"] = {
+            "added": sorted(added_tools),
+            "removed": sorted(removed_tools),
+            "total": len(new_tools),
+            "tokens_revoked": revoked_count,
+        }
+        logger.info("  >> Tools updated: %d added, %d removed, %d tokens revoked",
+                     len(added_tools), len(removed_tools), revoked_count)
+
+    if PROMETHEUS_AVAILABLE:
+        AGENTS_UPDATED.inc()
+        if revoked_count > 0:
+            TOKENS_REVOKED.inc(revoked_count)
+
+    logger.info("  Agent '%s' updated successfully", agent.name)
+
+    return {
+        "agent_id": agent.agent_id,
+        "did": agent.did_str,
+        "name": agent.name,
+        "tools": agent.tools,
+        "callback_url": agent.callback_url,
+        "changes": changes,
     }
 
 
