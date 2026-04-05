@@ -1173,6 +1173,9 @@ async def request_token(body: TokenRequest, x_api_key: str | None = Header(None)
     logger.info("  Resource URI: %s", resource_uri)
     logger.info("  Verbs: %s", sorted(verbs))
 
+    # Revocation gate
+    _check_revocation_gate(caller, target)
+
     # Authority issues token on behalf of the caller → target
     logger.info("  Signing token with authority ML-DSA-65 key...")
     t0 = time.perf_counter()
@@ -1643,6 +1646,26 @@ def _verify_capability_token(
     return token
 
 
+def _check_revocation_gate(caller: AgentRecord, target: AgentRecord) -> None:
+    """Deny new token issuance if caller has any revoked token for this target.
+
+    Prevents revocation bypass where a caller could simply request a fresh
+    token after the previous one was revoked.
+    """
+    for _tid, tok in caller.tokens_issued.items():
+        if tok.audience_did is not None and tok.audience_did == target.did:
+            if state.crl.is_revoked(tok.token_id):
+                logger.warning(
+                    "  DENIED: Caller has revoked token for target %s (token %s)",
+                    target.did_str,
+                    tok.token_id.hex()[:16],
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot issue token: a capability token for this target has been revoked",
+                )
+
+
 # -- Messaging --------------------------------------------------------------
 
 MIN_MESSAGE_TRUST_SCORE = 0.3
@@ -1666,6 +1689,9 @@ async def open_conversation(body: ConversationOpenRequest, x_api_key: str | None
             status_code=403,
             detail=f"Sender trust score {caller_trust['score']:.4f} below messaging threshold {MIN_MESSAGE_TRUST_SCORE}",
         )
+
+    # Revocation gate
+    _check_revocation_gate(caller, target)
 
     # Create conversation
     conversation_id = uuid.uuid4().hex
