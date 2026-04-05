@@ -1856,7 +1856,7 @@ def get_conversation_transcript(
 
     # Build agent name lookup
     names: dict[str, str] = {}
-    for ag in state.agents.values():
+    for ag in state.agents_by_did.values():
         names[ag.did_str] = ag.name
 
     lines: list[str] = []
