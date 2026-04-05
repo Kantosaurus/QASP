@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from starlette.responses import Response
 
@@ -476,6 +476,7 @@ class AgentRecord:
         "agent_id", "name", "did", "did_str",
         "public_key", "secret_key", "api_key",
         "callback_url", "tools", "tokens_issued", "metering",
+        "ip_address",
     )
 
     def __init__(
@@ -488,6 +489,7 @@ class AgentRecord:
         api_key: str,
         callback_url: str,
         tools: list[dict[str, Any]],
+        ip_address: str = "",
     ) -> None:
         self.agent_id = agent_id
         self.name = name
@@ -498,6 +500,7 @@ class AgentRecord:
         self.api_key = api_key
         self.callback_url = callback_url
         self.tools = tools
+        self.ip_address = ip_address
         self.tokens_issued: dict[str, CapabilityToken] = {}
         self.metering: list[dict[str, Any]] = []
 
@@ -560,6 +563,23 @@ class AuthorityState:
         if agent is None:
             raise HTTPException(status_code=404, detail=f"Agent not found: {target_did}")
         return agent
+
+    def check_name_ip_conflict(
+        self, name: str, ip_address: str, exclude_did: str | None = None,
+    ) -> None:
+        """Raise 409 if another agent from the same IP already uses this name."""
+        if not ip_address:
+            return
+        for agent in self.agents_by_did.values():
+            if (
+                agent.ip_address == ip_address
+                and agent.name == name
+                and agent.did_str != exclude_did
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"An agent named '{name}' is already registered from this IP address",
+                )
 
     def compute_trust(self, did_str: str) -> dict[str, Any]:
         entry = self.trust_registry.lookup(did_str)
@@ -765,6 +785,10 @@ def _api_key(x_api_key: str | None = Header(None)) -> str:
     return x_api_key
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else ""
+
+
 # -- Info -------------------------------------------------------------------
 
 @app.get("/")
@@ -826,11 +850,15 @@ def metrics():
 # -- Registration -----------------------------------------------------------
 
 @app.post("/register")
-def register(body: RegisterRequest):
+def register(body: RegisterRequest, request: Request):
     logger.info("--- POST /register ---")
     logger.info("  Agent name: %s", body.name)
     logger.info("  Tools declared: %s", [t.name for t in body.tools])
     logger.info("  Callback URL: %s", body.callback_url or "(none)")
+
+    client_ip = _client_ip(request)
+    logger.info("  Client IP: %s", client_ip or "(unknown)")
+    state.check_name_ip_conflict(name=body.name, ip_address=client_ip)
 
     logger.info("  Generating ML-DSA-65 keypair (pub=1952 bytes, sec=4032 bytes)...")
     t0 = time.perf_counter()
@@ -883,6 +911,7 @@ def register(body: RegisterRequest):
         api_key=api_key,
         callback_url=body.callback_url,
         tools=tools,
+        ip_address=client_ip,
     )
     state.agents_by_api_key[api_key] = agent
     state.agents_by_did[did_str] = agent
@@ -903,7 +932,7 @@ def register(body: RegisterRequest):
 # -- Agent update -----------------------------------------------------------
 
 @app.put("/agents/update")
-async def update_agent(body: AgentUpdateRequest, x_api_key: str | None = Header(None)):
+async def update_agent(body: AgentUpdateRequest, request: Request, x_api_key: str | None = Header(None)):
     agent = state.resolve_agent(_api_key(x_api_key))
 
     logger.info("--- PUT /agents/update ---")
@@ -918,6 +947,10 @@ async def update_agent(body: AgentUpdateRequest, x_api_key: str | None = Header(
 
     # -- Name --
     if body.name is not None:
+        client_ip = _client_ip(request)
+        state.check_name_ip_conflict(
+            name=body.name, ip_address=client_ip, exclude_did=agent.did_str,
+        )
         old_name = agent.name
         agent.name = body.name
         changes["name"] = {"old": old_name, "new": body.name}
