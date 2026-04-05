@@ -1120,10 +1120,16 @@ def discover(
 
         # Capability filter
         if capability != "*":
-            matched = any(
-                uri_matches(capability, t["resource_uri"])
-                for t in agent.tools
-            )
+            if capability.startswith("qasp://"):
+                matched = any(
+                    uri_matches(capability, t["resource_uri"])
+                    for t in agent.tools
+                )
+            else:
+                matched = any(
+                    t["name"] == capability
+                    for t in agent.tools
+                )
             if not matched:
                 logger.info("  Skipped '%s' (no matching capability)", agent.name)
                 continue
