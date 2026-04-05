@@ -66,19 +66,20 @@ def on_tool_call(payload: dict) -> dict:
     return result
 
 def on_connect() -> None:
-    print(f"[QASP] {AGENT_NAME} is ONLINE")
+    print(f"[QASP] {AGENT_NAME} is ONLINE - Connection established")
 
 def on_disconnect() -> None:
-    print(f"[QASP] {AGENT_NAME} is OFFLINE")
+    print(f"[QASP] {AGENT_NAME} is OFFLINE - Connection lost")
 
 async def main():
+    print(f"Starting {AGENT_NAME}...")
+    print(f"DID: {DID}")
+    print(f"Connecting to QASP Authority: {BASE_URL}")
+
     qasp = QASPClient(BASE_URL)
     qasp._api_key = API_KEY
     qasp._did = DID
     qasp._agent_name = AGENT_NAME
-
-    print(f"Starting {AGENT_NAME}...")
-    print(f"DID: {DID}")
 
     listener = qasp.create_websocket_listener(
         on_message=on_message,
@@ -88,7 +89,7 @@ async def main():
         on_disconnect=on_disconnect,
     )
 
-    print("Connecting to QASP WebSocket...")
+    print("WebSocket listener created. Starting connection...")
     await listener.run()
 
 if __name__ == "__main__":
