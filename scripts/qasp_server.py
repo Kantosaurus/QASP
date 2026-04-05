@@ -2161,6 +2161,8 @@ async def websocket_register_endpoint(websocket: WebSocket):
     except asyncio.TimeoutError:
         await websocket.close(code=4008, reason="Registration timeout — expected 'register' message within 10s")
         return
+    except WebSocketDisconnect:
+        return
     except Exception:
         await websocket.close(code=4009, reason="Failed to read registration message")
         return
