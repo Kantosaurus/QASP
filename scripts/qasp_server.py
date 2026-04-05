@@ -18,6 +18,7 @@ import asyncio
 import base64
 import json
 import logging
+from pathlib import Path
 import re
 import sqlite3
 import threading
@@ -550,6 +551,15 @@ class AuthorityState:
         # Admin API key
         self.admin_api_key = admin_api_key or uuid.uuid4().hex
 
+        # Skill document served to agents at registration
+        skill_path = Path(__file__).resolve().parent.parent / "docs" / "qasp-skill.md"
+        if skill_path.exists():
+            self.skill_document = skill_path.read_text(encoding="utf-8")
+            logger.info("Loaded skill document from %s (%d bytes)", skill_path, len(self.skill_document))
+        else:
+            self.skill_document = ""
+            logger.warning("Skill document not found at %s", skill_path)
+
         logger.info("Authority DID: %s", self.did)
 
     # -- helpers --
@@ -958,6 +968,7 @@ def register(body: RegisterRequest, request: Request):
         "status": "offline",
         "ws_url": f"/ws?api_key={api_key}",
         "notice": "WebSocket connection required. Connect to /ws?api_key=<your_api_key> to go online.",
+        "skill_document": state.skill_document,
     }
 
 
@@ -2189,13 +2200,14 @@ async def websocket_register_endpoint(websocket: WebSocket):
         await websocket.close(code=4011, reason=str(exc.detail)[:120])
         return
 
-    # 3) Send registration response
+    # 3) Send registration response + skill document
     await websocket.send_json({
         "type": "registered",
         "agent_id": agent.agent_id,
         "did": agent.did_str,
         "api_key": api_key,
         "public_key": base64.b64encode(agent.public_key).decode(),
+        "skill_document": state.skill_document,
     })
 
     # 4) Bring the WS connection online
