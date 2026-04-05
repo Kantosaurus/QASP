@@ -476,7 +476,7 @@ class AgentRecord:
         "agent_id", "name", "did", "did_str",
         "public_key", "secret_key", "api_key",
         "callback_url", "tools", "tokens_issued", "metering",
-        "ip_address",
+        "ip_address", "status",
     )
 
     def __init__(
@@ -490,6 +490,7 @@ class AgentRecord:
         callback_url: str,
         tools: list[dict[str, Any]],
         ip_address: str = "",
+        status: str = "online",
     ) -> None:
         self.agent_id = agent_id
         self.name = name
@@ -501,6 +502,7 @@ class AgentRecord:
         self.callback_url = callback_url
         self.tools = tools
         self.ip_address = ip_address
+        self.status = status
         self.tokens_issued: dict[str, CapabilityToken] = {}
         self.metering: list[dict[str, Any]] = []
 
@@ -603,6 +605,85 @@ class AuthorityState:
                 "confidence": round(score.confidence, 4),
             },
         }
+
+    def register_agent(
+        self,
+        name: str,
+        tools_defs: list["ToolDef"],
+        callback_url: str,
+        ip_address: str,
+        status: str = "online",
+    ) -> tuple["AgentRecord", str]:
+        """Core registration: keypair, DID, trust, tool URIs, AgentRecord.
+
+        Returns (agent, api_key).  Both the HTTP and WebSocket registration
+        endpoints delegate to this method.
+        """
+        self.check_name_ip_conflict(name=name, ip_address=ip_address)
+
+        logger.info("  Generating ML-DSA-65 keypair (pub=1952 bytes, sec=4032 bytes)...")
+        t0 = time.perf_counter()
+        pub, sec = generate_keypair()
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info("  >> Keypair generated in %.1fms", elapsed_ms)
+
+        did, did_doc = create_did(pub)
+        did_str = str(did)
+        logger.info("  >> DID created: %s", did_str)
+
+        # Register DID
+        self.did_registry.register(did_doc)
+        logger.info("  >> DID document registered in DID registry")
+
+        # Register trust entry
+        self.trust_registry.register(did)
+        logger.info("  >> Trust entry initialised (score=0.5)")
+
+        # Build tool list with resource URIs
+        tools: list[dict[str, Any]] = []
+        did_short = did.identifier[:12]
+        for t in tools_defs:
+            resource_uri = f"qasp://agents/{did_short}/tools/{t.name}"
+            tools.append({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema or {"type": "object"},
+                "resource_uri": resource_uri,
+            })
+            logger.info("  >> Tool '%s' -> ARM URI: %s", t.name, resource_uri)
+
+        # Virtual messaging tool — every agent can receive messages
+        msg_resource_uri = f"qasp://agents/{did_short}/messages"
+        tools.append({
+            "name": "_messages",
+            "description": "Agent-to-agent messaging",
+            "input_schema": {"type": "object"},
+            "resource_uri": msg_resource_uri,
+        })
+        logger.info("  >> Virtual tool '_messages' -> ARM URI: %s", msg_resource_uri)
+
+        api_key = uuid.uuid4().hex
+        agent = AgentRecord(
+            agent_id=uuid.uuid4().hex,
+            name=name,
+            did=did,
+            public_key=pub,
+            secret_key=sec,
+            api_key=api_key,
+            callback_url=callback_url,
+            tools=tools,
+            ip_address=ip_address,
+            status=status,
+        )
+        self.agents_by_api_key[api_key] = agent
+        self.agents_by_did[did_str] = agent
+
+        logger.info("  Agent '%s' registered successfully (total agents: %d)", name, len(self.agents_by_did))
+
+        if PROMETHEUS_AVAILABLE:
+            AGENTS_REGISTERED.set(len(self.agents_by_did))
+
+        return agent, api_key
 
 
 # ============================================================================
@@ -798,6 +879,8 @@ def root():
         "version": "0.1.0",
         "did": str(state.did),
         "agents_registered": len(state.agents_by_did),
+        "agents_online": state.ws_manager.connected_count,
+        "ws_registration_url": "/ws/register",
         "features": [
             "ML-DSA-65 post-quantum signatures",
             "DID-based agent identity",
@@ -810,7 +893,7 @@ def root():
             "Dispute resolution",
             "Tool call relay with metering",
             "Agent-to-agent messaging with conversations",
-            "WebSocket real-time push",
+            "WebSocket-first registration and real-time push",
         ],
     }
 
@@ -828,7 +911,7 @@ def features():
         {"id": "dispute", "name": "Dispute Resolution", "description": "Open disputes, evidence, binding verdicts"},
         {"id": "relay", "name": "Tool Call Relay", "description": "Verify token → relay to agent callback → meter usage"},
         {"id": "metering", "name": "Usage Metering", "description": "Per-call receipts with cost tracking"},
-        {"id": "websocket", "name": "WebSocket Push", "description": "Real-time server-to-agent delivery via persistent WebSocket connections"},
+        {"id": "websocket", "name": "WebSocket-First", "description": "Agents register and communicate over persistent WebSocket connections; callback URLs serve as an optional fallback"},
     ]
 
 
@@ -858,74 +941,23 @@ def register(body: RegisterRequest, request: Request):
 
     client_ip = _client_ip(request)
     logger.info("  Client IP: %s", client_ip or "(unknown)")
-    state.check_name_ip_conflict(name=body.name, ip_address=client_ip)
 
-    logger.info("  Generating ML-DSA-65 keypair (pub=1952 bytes, sec=4032 bytes)...")
-    t0 = time.perf_counter()
-    pub, sec = generate_keypair()
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    logger.info("  >> Keypair generated in %.1fms", elapsed_ms)
-
-    did, did_doc = create_did(pub)
-    did_str = str(did)
-    logger.info("  >> DID created: %s", did_str)
-
-    # Register DID
-    state.did_registry.register(did_doc)
-    logger.info("  >> DID document registered in DID registry")
-
-    # Register trust entry
-    state.trust_registry.register(did)
-    logger.info("  >> Trust entry initialised (score=0.5)")
-
-    # Build tool list with resource URIs
-    tools: list[dict[str, Any]] = []
-    did_short = did.identifier[:12]
-    for t in body.tools:
-        resource_uri = f"qasp://agents/{did_short}/tools/{t.name}"
-        tools.append({
-            "name": t.name,
-            "description": t.description,
-            "input_schema": t.input_schema or {"type": "object"},
-            "resource_uri": resource_uri,
-        })
-        logger.info("  >> Tool '%s' -> ARM URI: %s", t.name, resource_uri)
-
-    # Virtual messaging tool — every agent can receive messages
-    msg_resource_uri = f"qasp://agents/{did_short}/messages"
-    tools.append({
-        "name": "_messages",
-        "description": "Agent-to-agent messaging",
-        "input_schema": {"type": "object"},
-        "resource_uri": msg_resource_uri,
-    })
-    logger.info("  >> Virtual tool '_messages' -> ARM URI: %s", msg_resource_uri)
-
-    api_key = uuid.uuid4().hex
-    agent = AgentRecord(
-        agent_id=uuid.uuid4().hex,
+    agent, api_key = state.register_agent(
         name=body.name,
-        did=did,
-        public_key=pub,
-        secret_key=sec,
-        api_key=api_key,
+        tools_defs=body.tools,
         callback_url=body.callback_url,
-        tools=tools,
         ip_address=client_ip,
+        status="offline",  # not yet connected via WebSocket
     )
-    state.agents_by_api_key[api_key] = agent
-    state.agents_by_did[did_str] = agent
-
-    logger.info("  Agent '%s' registered successfully (total agents: %d)", body.name, len(state.agents_by_did))
-
-    if PROMETHEUS_AVAILABLE:
-        AGENTS_REGISTERED.set(len(state.agents_by_did))
 
     return {
         "agent_id": agent.agent_id,
-        "did": did_str,
+        "did": agent.did_str,
         "api_key": api_key,
-        "public_key": base64.b64encode(pub).decode(),
+        "public_key": base64.b64encode(agent.public_key).decode(),
+        "status": "offline",
+        "ws_url": f"/ws?api_key={api_key}",
+        "notice": "WebSocket connection required. Connect to /ws?api_key=<your_api_key> to go online.",
     }
 
 
@@ -1051,6 +1083,7 @@ async def update_agent(body: AgentUpdateRequest, request: Request, x_api_key: st
         "name": agent.name,
         "tools": agent.tools,
         "callback_url": agent.callback_url,
+        "status": agent.status,
         "changes": changes,
     }
 
@@ -1090,6 +1123,8 @@ def discover(
             "did": agent.did_str,
             "tools": agent.tools,
             "trust_score": trust["score"],
+            "status": agent.status,
+            "ws_connected": state.ws_manager.is_connected(agent.did_str),
             "endpoint": agent.callback_url or "(relay via server)",
         })
 
@@ -1385,7 +1420,7 @@ async def call_tool(body: ToolCallRequest, x_api_key: str | None = Header(None))
             "echo": body.arguments,
             "tool": body.tool_name,
             "handled_by": target.name,
-            "note": "No callback_url or WebSocket connected; echoing arguments",
+            "note": "Agent is offline — no WebSocket connected and no callback_url fallback",
         }
 
     # 6) Metering
@@ -2013,29 +2048,14 @@ async def _notify_revocation(token_id_hex: str, revoker_did: str, reason: str) -
 # -- WebSocket real-time channel ---------------------------------------------
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, api_key: str = Query(...)):
-    # Authenticate before accepting
-    agent = state.agents_by_api_key.get(api_key)
-    if agent is None:
-        await websocket.close(code=4003, reason="Invalid API key")
-        return
-
-    await websocket.accept()
-    await state.ws_manager.connect(agent.did_str, websocket)
-    if PROMETHEUS_AVAILABLE:
-        WEBSOCKET_CONNECTIONS.inc()
-    logger.info("WebSocket CONNECTED: '%s' (%s)", agent.name, agent.did_str)
-
-    # Welcome message
+async def _ws_welcome_and_flush(websocket: WebSocket, agent: AgentRecord) -> None:
+    """Send the welcome frame and flush any pending inbox messages."""
     await websocket.send_json({
         "type": "connected",
         "agent_did": agent.did_str,
         "server_did": str(state.did),
         "timestamp": datetime.now(UTC).isoformat(),
     })
-
-    # Flush pending inbox messages
     pending = state.store.query_inbox(agent.did_str, limit=50)
     for msg in pending:
         await websocket.send_json({"type": "message", "payload": msg})
@@ -2043,7 +2063,13 @@ async def websocket_endpoint(websocket: WebSocket, api_key: str = Query(...)):
     if pending:
         logger.info("  Flushed %d pending messages to '%s' via WebSocket", len(pending), agent.name)
 
-    # Listen loop
+
+async def _ws_listen_loop(websocket: WebSocket, agent: AgentRecord) -> None:
+    """Shared WebSocket listen loop used by both /ws and /ws/register.
+
+    Blocks until the connection closes.  The finally block marks the agent
+    offline, removes the connection, and decrements the Prometheus gauge.
+    """
     try:
         while True:
             data = await websocket.receive_json()
@@ -2072,10 +2098,114 @@ async def websocket_endpoint(websocket: WebSocket, api_key: str = Query(...)):
     except Exception as exc:
         logger.warning("WebSocket error for '%s': %s", agent.name, exc)
     finally:
+        agent.status = "offline"
         await state.ws_manager.disconnect(agent.did_str)
         if PROMETHEUS_AVAILABLE:
             WEBSOCKET_CONNECTIONS.dec()
-        logger.info("WebSocket DISCONNECTED: '%s' (%s)", agent.name, agent.did_str)
+        logger.info("WebSocket DISCONNECTED: '%s' (%s) — status → offline", agent.name, agent.did_str)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, api_key: str = Query(...)):
+    """Reconnect an already-registered agent via its API key."""
+    agent = state.agents_by_api_key.get(api_key)
+    if agent is None:
+        await websocket.close(code=4003, reason="Invalid API key")
+        return
+
+    await websocket.accept()
+    await state.ws_manager.connect(agent.did_str, websocket)
+    agent.status = "online"
+    if PROMETHEUS_AVAILABLE:
+        WEBSOCKET_CONNECTIONS.inc()
+    logger.info("WebSocket CONNECTED: '%s' (%s) — status → online", agent.name, agent.did_str)
+
+    await _ws_welcome_and_flush(websocket, agent)
+    await _ws_listen_loop(websocket, agent)
+
+
+@app.websocket("/ws/register")
+async def websocket_register_endpoint(websocket: WebSocket):
+    """Register a new agent over WebSocket (preferred path).
+
+    Protocol:
+      1. Client connects (no auth required — it is registering).
+      2. Client sends: {"type": "register", "name": "...", "tools": [...],
+                        "callback_url": "..."}
+      3. Server replies: {"type": "registered", "agent_id", "did",
+                          "api_key", "public_key"}
+      4. Connection enters the standard listen loop; agent is online.
+    """
+    await websocket.accept()
+
+    # 1) Wait for the register message
+    try:
+        data = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+    except asyncio.TimeoutError:
+        await websocket.close(code=4008, reason="Registration timeout — expected 'register' message within 10s")
+        return
+    except Exception:
+        await websocket.close(code=4009, reason="Failed to read registration message")
+        return
+
+    if data.get("type") != "register":
+        await websocket.send_json({"type": "error", "detail": "Expected message type 'register'"})
+        await websocket.close(code=4009, reason="Expected 'register' message")
+        return
+
+    name = data.get("name", "")
+    tools_raw = data.get("tools", [])
+    callback_url = data.get("callback_url", "")
+
+    if not name:
+        await websocket.send_json({"type": "error", "detail": "Field 'name' is required"})
+        await websocket.close(code=4010, reason="Missing name")
+        return
+
+    # Parse raw tool dicts into ToolDef objects
+    tool_defs = [
+        ToolDef(
+            name=t["name"],
+            description=t.get("description", ""),
+            input_schema=t.get("input_schema"),
+        )
+        for t in tools_raw
+        if isinstance(t, dict) and "name" in t
+    ]
+
+    client_ip = websocket.client.host if websocket.client else ""
+
+    # 2) Run core registration (may raise HTTPException on conflict)
+    try:
+        agent, api_key = state.register_agent(
+            name=name,
+            tools_defs=tool_defs,
+            callback_url=callback_url,
+            ip_address=client_ip,
+            status="online",
+        )
+    except HTTPException as exc:
+        await websocket.send_json({"type": "error", "detail": exc.detail})
+        await websocket.close(code=4011, reason=str(exc.detail)[:120])
+        return
+
+    # 3) Send registration response
+    await websocket.send_json({
+        "type": "registered",
+        "agent_id": agent.agent_id,
+        "did": agent.did_str,
+        "api_key": api_key,
+        "public_key": base64.b64encode(agent.public_key).decode(),
+    })
+
+    # 4) Bring the WS connection online
+    await state.ws_manager.connect(agent.did_str, websocket)
+    if PROMETHEUS_AVAILABLE:
+        WEBSOCKET_CONNECTIONS.inc()
+    logger.info("WebSocket REGISTERED+CONNECTED: '%s' (%s) — status → online", agent.name, agent.did_str)
+
+    await _ws_welcome_and_flush(websocket, agent)
+    await _ws_listen_loop(websocket, agent)
 
 
 # -- Admin ------------------------------------------------------------------
@@ -2101,6 +2231,9 @@ def admin_list_agents(x_admin_key: str | None = Header(None)):
             "tokens_issued": len(agent.tokens_issued),
             "metering_count": len(agent.metering),
             "trust_score": trust["score"],
+            "status": agent.status,
+            "ws_connected": state.ws_manager.is_connected(agent.did_str),
+            "callback_url": agent.callback_url or None,
         })
     return {"agents": agents, "total": len(agents)}
 
