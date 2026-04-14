@@ -121,7 +121,7 @@ class RelayManager:
     # ------------------------------------------------------------------
 
     async def _handle_request(self, alice_did: str, req: RelaySessionRequest) -> None:
-        if len(self._sessions) >= MAX_CONCURRENT_SESSIONS:
+        if len(self._sessions) + len(self._pending_notify) >= MAX_CONCURRENT_SESSIONS:
             await self._send_deny(alice_did, req.nonce, RelayOverloadedError("too many sessions"))
             return
 
@@ -244,6 +244,12 @@ class RelayManager:
         direction = DIRECTION_A_TO_B if sender_did == session.initiator_did else DIRECTION_B_TO_A
         other_did = session.target_did if direction == DIRECTION_A_TO_B else session.initiator_did
 
+        # Piggybacked ACK: the sender confirms delivery of a reverse-direction
+        # message.  Wire format: 8-byte big-endian unsigned integer (seq number).
+        if msg.receipt_ack is not None:
+            acked_seq = int.from_bytes(msg.receipt_ack, "big")
+            await self._on_delivery_ack(session.session_id, acked_seq)
+
         if not validate_scm(
             msg.scm, self.key_ring, session.session_id, session.cap_token_hash, direction,
         ):
@@ -338,6 +344,14 @@ class RelayManager:
                 if ids:
                     ids.discard(session_id)
         session.on_close()
+
+        # Cancel any outstanding delivery-timeout tasks for this session so
+        # they don't leak for up to DELIVERY_TIMEOUT_SEC after teardown.
+        for key in [k for k in self._delivery_tasks if k[0] == session_id]:
+            t = self._delivery_tasks.pop(key)
+            if not t.done():
+                t.cancel()
+
         close = RelaySessionClose(
             session_id=session_id, reason_code=reason_code, reason_text=reason_text,
         ).to_cbor()

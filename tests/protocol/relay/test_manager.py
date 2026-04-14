@@ -213,3 +213,72 @@ class TestBudgetAndTimeout:
         assert session.msg_remaining == 4
         await manager._on_delivery_timeout(grant.session_id, seq=1)
         assert session.msg_remaining == 5
+
+
+class TestDeliveryAck:
+    @pytest.mark.asyncio
+    async def test_receipt_ack_confirms_delivery(self, manager, stub_ws):
+        """PRD §7.3: an incoming RelayData with receipt_ack confirms a prior seq."""
+        grant = await _open_session(manager, stub_ws, budget=5)
+        session = manager._sessions[grant.session_id]
+
+        # Alice sends seq=1 to Bob. That creates a pending debit.
+        await manager.handle_frame(
+            "did:qasp:alice",
+            RelayData(
+                session_id=grant.session_id, scm=grant.scm, seq=1,
+                payload=b"x", receipt_ack=None,
+            ).to_cbor(),
+        )
+        assert 1 in session.pending_debits
+
+        # Bob now sends a reverse-direction message with receipt_ack=1 (8-byte BE).
+        # It should clear the pending debit for seq=1.
+        # Note: Bob's SCM is session.scm_b — we look it up directly.
+        await manager.handle_frame(
+            "did:qasp:bob",
+            RelayData(
+                session_id=grant.session_id, scm=session.scm_b, seq=1,
+                payload=b"reply", receipt_ack=(1).to_bytes(8, "big"),
+            ).to_cbor(),
+        )
+        assert 1 not in session.pending_debits
+
+
+class TestTeardownCancelsTasks:
+    @pytest.mark.asyncio
+    async def test_teardown_cancels_delivery_tasks(self, manager, stub_ws):
+        grant = await _open_session(manager, stub_ws, budget=5)
+        await manager.handle_frame(
+            "did:qasp:alice",
+            RelayData(
+                session_id=grant.session_id, scm=grant.scm, seq=1,
+                payload=b"x", receipt_ack=None,
+            ).to_cbor(),
+        )
+        # A delivery task should exist
+        keys = [k for k in manager._delivery_tasks if k[0] == grant.session_id]
+        assert len(keys) == 1
+        # Tear down
+        await manager._teardown_session(grant.session_id, 0x26, "test")
+        # Tasks for this session should be cancelled and removed
+        keys_after = [k for k in manager._delivery_tasks if k[0] == grant.session_id]
+        assert keys_after == []
+
+
+class TestPendingSessionCap:
+    @pytest.mark.asyncio
+    async def test_pending_sessions_count_toward_limit(self, manager, stub_ws):
+        """Bug C3: pending-notify sessions must count toward MAX_CONCURRENT_SESSIONS."""
+        from qasp.protocol.relay.manager import MAX_CONCURRENT_SESSIONS
+        # Fill pending_notify with MAX_CONCURRENT_SESSIONS fake entries.
+        manager._pending_notify = {i.to_bytes(16, "big"): None for i in range(MAX_CONCURRENT_SESSIONS)}
+        await manager.handle_frame("did:qasp:alice", _request().to_cbor())
+        denies = [
+            decode_relay_frame(f) for did, f in stub_ws.sent
+            if did == "did:qasp:alice"
+        ]
+        assert any(
+            isinstance(d, RelaySessionDeny) and d.error_code == 0x24
+            for d in denies
+        )
