@@ -12,7 +12,9 @@ from qasp.protocol.capability import (
     ARM_CHARGE,
     ARM_DELEGATE,
     ARM_EXEC,
+    ARM_MESSAGE,
     ARM_READ,
+    ARM_RELAY,
     ARM_REVOKE,
     ARM_VERBS,
     ARM_WRITE,
@@ -50,13 +52,13 @@ from qasp.protocol.capability import (
 class TestARMVerbConstants:
     """Tests for canonical ARM verb constants."""
 
-    def test_all_seven_constants_are_strings(self) -> None:
+    def test_all_arm_constants_are_strings(self) -> None:
         for verb in [ARM_READ, ARM_WRITE, ARM_EXEC, ARM_DELEGATE,
-                     ARM_CHARGE, ARM_ATTENUATE, ARM_REVOKE]:
+                     ARM_CHARGE, ARM_ATTENUATE, ARM_REVOKE, ARM_MESSAGE, ARM_RELAY]:
             assert isinstance(verb, str)
 
-    def test_arm_verbs_has_seven_members(self) -> None:
-        assert len(ARM_VERBS) == 7
+    def test_arm_verbs_has_nine_members(self) -> None:
+        assert len(ARM_VERBS) == 9
 
     def test_arm_verbs_is_frozenset(self) -> None:
         assert isinstance(ARM_VERBS, frozenset)
@@ -69,11 +71,13 @@ class TestARMVerbConstants:
         assert ARM_CHARGE in ARM_VERBS
         assert ARM_ATTENUATE in ARM_VERBS
         assert ARM_REVOKE in ARM_VERBS
+        assert ARM_MESSAGE in ARM_VERBS
+        assert ARM_RELAY in ARM_VERBS
 
     def test_verbset_from_arm_verbs(self) -> None:
         """ARM_VERBS can be used to create a VerbSet."""
         vs = VerbSet(ARM_VERBS)
-        assert len(vs) == 7
+        assert len(vs) == 9
         assert ARM_READ in vs
 
 
@@ -1684,3 +1688,10 @@ class TestMultiOwnerToken:
         """Empty authority chains raises MultiOwnerValidationError."""
         with pytest.raises(MultiOwnerValidationError):
             create_multi_owner_token([])
+
+
+def test_arm_relay_verb_is_registered():
+    """PRD §10.2 adds a new `relay` verb for CapFlow tokens."""
+    from qasp.protocol.capability import ARM_RELAY, ARM_VERBS
+    assert ARM_RELAY == "relay"
+    assert ARM_RELAY in ARM_VERBS
