@@ -36,6 +36,7 @@
 27. [End-to-End Protocol Flow](#27-end-to-end-protocol-flow)
 28. [Security Properties](#28-security-properties)
 29. [Constants Reference](#29-constants-reference)
+30. [QASP-Relay (CapFlow)](#30-qasp-relay-capflow)
 
 ---
 
@@ -1559,6 +1560,64 @@ WITNESS_CREDIBILITY_THRESH = 0.8
 BEHAVIORAL_WINDOW_SIZE     = 100 events
 COLD_START_CONFIDENCE_THRESH = 0.3
 ```
+
+---
+
+## 30. QASP-Relay (CapFlow) — seventh sub-protocol
+
+**Authoritative spec:** `docs/capflow-prd.docx`.
+
+CapFlow lets Agent A relay real-time messages to Agent B through the authority
+server with per-message capability-token enforcement. It addresses the gap in
+QASP where agents could talk to the authority but had no protocol path for
+agent-to-agent message relay with per-message authorization.
+
+### Split-plane architecture
+
+| Tier | Cost | Responsibility |
+|---|---|---|
+| Tier 3 PQC Verifier | ~50–90 µs | Validates the full ML-DSA-65 capability token **once** at session establishment. |
+| Tier 2 Stateful Engine | ~1–10 µs | Derives per-session 256-bit HMAC Session Capability MACs (SCMs); attenuates tokens for the target. |
+| Tier 1 Fast path | < 1 µs (Python) | Validates SCM and updates metering counters on every forwarded message. |
+
+### Message types
+
+Seven new message type IDs (0x20–0x26) extend the `MessageType` enum in
+`src/qasp/framing/messages.py`:
+
+| ID | Message | Direction |
+|---|---|---|
+| 0x20 | RelaySessionRequest | A → Relay |
+| 0x21 | RelaySessionGrant | Relay → A (and → B) |
+| 0x22 | RelaySessionDeny | Relay → A |
+| 0x23 | RelaySessionNotify | Relay → B |
+| 0x24 | RelaySessionAccept | B → Relay |
+| 0x25 | RelayData | A ↔ B (via Relay) |
+| 0x26 | RelaySessionClose | Any → All |
+
+### Implementation location
+
+- Protocol sans-I/O: `src/qasp/protocol/relay/` (errors, messages, scm, receipts, session, attenuation, manager).
+- Server integration: `scripts/qasp_server.py` — `AuthorityState.relay_manager` + `_ws_listen_loop` binary dispatch.
+- Client helpers: `scripts/qasp_client.py` — `QASPWebSocketListener.open_relay_session`, `send_relay_data`, `close_relay_session`, `accept_relay_session`.
+- Demos: `scripts/demos/relay_direct.py`, `relay_delegation_chain.py`, `relay_metering_dispute.py`.
+- Benchmarks: `scripts/bench_capflow.py`; results in `docs/capflow-benchmarks.md`.
+
+### Security properties
+
+- **Capability confinement:** no message transits the relay without a valid
+  non-exhausted capability token. Verified once at session open; subsequent
+  messages are HMAC-validated in constant time.
+- **Direction binding:** A's SCM cannot impersonate B's SCM (direction byte
+  in the HMAC input).
+- **Epoch rotation:** K_server rotates every `EPOCH_INTERVAL_SEC` (default
+  300 s); a 2-second grace window absorbs in-flight messages straddling a
+  rotation boundary.
+- **Atomic metering:** budget debits are pending until the recipient
+  acknowledges delivery. Unacknowledged messages roll back the debit.
+- **Tamper-evident receipts:** SHA-384 hash chain of RelayReceipts, each
+  HMAC-signed. The session summary receipt at close is ML-DSA-65-signed and
+  compatible with the existing QASP-Meter Receipt format.
 
 ---
 
