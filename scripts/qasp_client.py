@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -800,6 +801,7 @@ class QASPWebSocketListener:
         conversations: dict[str, ConversationLog] | None = None,
         agent_name: str = "",
         on_message: Callable[[dict], None] | None = None,
+        on_relay_data: Callable[["Any"], None] | None = None,
         on_conversation: Callable[[dict], None] | None = None,
         on_tool_call: Callable[[dict], dict] | None = None,
         on_token_revoked: Callable[[dict], None] | None = None,
@@ -816,6 +818,7 @@ class QASPWebSocketListener:
         self._conversations = conversations if conversations is not None else {}
         self._agent_name = agent_name
         self._on_message = on_message
+        self._on_relay_data = on_relay_data
         self._on_conversation = on_conversation
         self._on_tool_call = on_tool_call
         self._on_token_revoked = on_token_revoked
@@ -828,6 +831,10 @@ class QASPWebSocketListener:
         self._max_reconnect_delay = max_reconnect_delay
         self._running = False
         self._ws = None
+        # QASP-Relay (CapFlow) state
+        self._relay_sessions: dict[bytes, Any] = {}  # session_id -> last-seen Grant
+        self._relay_next_seq: dict[bytes, int] = {}
+        self._pending_relay_frames: asyncio.Queue = asyncio.Queue()
 
     async def _handle(self, ws: Any, data: dict) -> None:
         """Dispatch an incoming WebSocket message to the appropriate callback."""
@@ -905,6 +912,151 @@ class QASPWebSocketListener:
         else:
             logger.debug("Unhandled WebSocket message type: %s", msg_type)
 
+    async def _handle_relay_bytes(self, frame: bytes) -> None:
+        """Decode a CBOR relay frame and route to the appropriate handler."""
+        try:
+            from qasp.protocol.relay.messages import (
+                RelayData,
+                RelaySessionGrant,
+                RelaySessionNotify,
+                decode_relay_frame,
+            )
+            msg = decode_relay_frame(frame)
+        except ValueError as exc:
+            logger.warning("Ignoring malformed relay frame: %s", exc)
+            return
+
+        if isinstance(msg, RelaySessionGrant):
+            # Cache so send_relay_data can use the SCM
+            self._relay_sessions[msg.session_id] = msg
+            await self._pending_relay_frames.put(msg)
+        elif isinstance(msg, RelayData):
+            if self._on_relay_data:
+                try:
+                    self._on_relay_data(msg)
+                except Exception as exc:
+                    logger.warning("on_relay_data callback raised: %s", exc)
+        else:
+            # Notify / Deny / Close / Accept — surface via the queue for callers to await
+            await self._pending_relay_frames.put(msg)
+
+    async def _await_relay(self, predicate, timeout: float = 5.0):
+        """Pop frames from _pending_relay_frames until predicate(frame) is True."""
+        async def _drain():
+            while True:
+                frame = await self._pending_relay_frames.get()
+                if predicate(frame):
+                    return frame
+        return await asyncio.wait_for(_drain(), timeout=timeout)
+
+    async def open_relay_session(
+        self,
+        target_did: str,
+        capability_token_bytes: bytes,
+        *,
+        max_messages: int | None = 100,
+        max_bytes: int | None = 10_000,
+        duration_sec: int = 60,
+        purpose: str | None = None,
+        timeout: float = 5.0,
+    ) -> "Any":
+        """Send a RelaySessionRequest and wait for the matching RelaySessionGrant.
+
+        Returns the Grant object (with session_id + scm).
+        """
+        from qasp.protocol.relay.messages import (
+            RelaySessionGrant,
+            RelaySessionParams,
+            RelaySessionRequest,
+        )
+        if self._ws is None:
+            raise RuntimeError("WebSocket is not connected")
+        req = RelaySessionRequest(
+            target_agent=target_did,
+            capability_token=capability_token_bytes,
+            session_params=RelaySessionParams(
+                max_messages=max_messages,
+                max_bytes=max_bytes,
+                max_rate=None,
+                duration_sec=duration_sec,
+                purpose=purpose,
+            ),
+            ephemeral_pk=None,
+            nonce=os.urandom(32),
+        )
+        await self._ws.send(req.to_cbor())
+        grant = await self._await_relay(
+            lambda m: isinstance(m, RelaySessionGrant),
+            timeout=timeout,
+        )
+        self._relay_sessions[grant.session_id] = grant
+        self._relay_next_seq.setdefault(grant.session_id, 1)
+        return grant
+
+    async def send_relay_data(
+        self,
+        session_id: bytes,
+        payload: bytes,
+        *,
+        receipt_ack_seq: int | None = None,
+    ) -> None:
+        """Send a RelayData frame over an established relay session."""
+        from qasp.protocol.relay.messages import RelayData
+        if self._ws is None:
+            raise RuntimeError("WebSocket is not connected")
+        grant = self._relay_sessions.get(session_id)
+        if grant is None:
+            raise KeyError(f"no active relay session {session_id.hex()}")
+        seq = self._relay_next_seq.get(session_id, 1)
+        self._relay_next_seq[session_id] = seq + 1
+        ack_bytes = (
+            receipt_ack_seq.to_bytes(8, "big") if receipt_ack_seq is not None else None
+        )
+        frame = RelayData(
+            session_id=session_id,
+            scm=grant.scm,
+            seq=seq,
+            payload=payload,
+            receipt_ack=ack_bytes,
+        )
+        await self._ws.send(frame.to_cbor())
+
+    async def close_relay_session(
+        self,
+        session_id: bytes,
+        reason_text: str = "done",
+        reason_code: int = 0x26,
+    ) -> None:
+        """Close an established relay session."""
+        from qasp.protocol.relay.messages import RelaySessionClose
+        if self._ws is None:
+            raise RuntimeError("WebSocket is not connected")
+        frame = RelaySessionClose(
+            session_id=session_id,
+            reason_code=reason_code,
+            reason_text=reason_text,
+        )
+        await self._ws.send(frame.to_cbor())
+        self._relay_sessions.pop(session_id, None)
+        self._relay_next_seq.pop(session_id, None)
+
+    async def accept_relay_session(
+        self, session_id: bytes, accepted: bool = True,
+    ) -> None:
+        """Respond to an incoming RelaySessionNotify by accepting (or declining)."""
+        from qasp.protocol.relay.messages import RelaySessionAccept
+        if self._ws is None:
+            raise RuntimeError("WebSocket is not connected")
+        frame = RelaySessionAccept(session_id=session_id, accepted=accepted)
+        await self._ws.send(frame.to_cbor())
+
+    async def await_relay_notify(self, timeout: float = 5.0) -> "Any":
+        """Block until a RelaySessionNotify arrives."""
+        from qasp.protocol.relay.messages import RelaySessionNotify
+        return await self._await_relay(
+            lambda m: isinstance(m, RelaySessionNotify), timeout=timeout,
+        )
+
     async def run(self) -> None:
         """Connect and listen forever, reconnecting on failure."""
         try:
@@ -927,8 +1079,13 @@ class QASPWebSocketListener:
                         self._on_connect()
 
                     async for raw in ws:
-                        data = json.loads(raw)
-                        await self._handle(ws, data)
+                        if isinstance(raw, (bytes, bytearray)):
+                            # Binary CBOR frame — route to relay handler if any
+                            await self._handle_relay_bytes(bytes(raw))
+                        else:
+                            # Text JSON frame — existing dispatch
+                            data = json.loads(raw)
+                            await self._handle(ws, data)
 
             except Exception as exc:
                 self._ws = None
