@@ -48,6 +48,8 @@ try:
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
+import os
+
 from qasp.crypto.signatures import generate_keypair
 from qasp.identity.did import DID, DIDRegistry, create_did
 from qasp.protocol.arm import uri_matches
@@ -59,6 +61,8 @@ from qasp.protocol.capability import (
     create_token,
     verify_token,
 )
+from qasp.protocol.relay import RelayManager, RelayReceipt
+from qasp.protocol.relay.attenuation import attenuate_for_target
 from qasp.protocol.ocsp import OCSPResponder, OCSPStatus, create_ocsp_request
 from qasp.protocol.rate_limiter import RateLimiterRegistry
 from qasp.protocol.revocation import (
@@ -126,6 +130,28 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at       TEXT NOT NULL,
     delivered        INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+);
+CREATE TABLE IF NOT EXISTS relay_sessions (
+    session_id      BLOB PRIMARY KEY,
+    initiator_did   TEXT NOT NULL,
+    target_did      TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    cap_token_hash  BLOB NOT NULL,
+    opened_at       INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    closed_at       INTEGER
+);
+CREATE TABLE IF NOT EXISTS relay_receipts (
+    session_id       BLOB NOT NULL,
+    seq              INTEGER NOT NULL,
+    msg_hash         BLOB NOT NULL,
+    timestamp        INTEGER NOT NULL,
+    direction        INTEGER NOT NULL,
+    cumulative_msgs  INTEGER NOT NULL,
+    cumulative_bytes INTEGER NOT NULL,
+    prev_hash        BLOB NOT NULL,
+    relay_sig        BLOB NOT NULL,
+    PRIMARY KEY (session_id, seq)
 );
 """
 
@@ -395,6 +421,52 @@ class PersistentStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    # -- relay --
+
+    def record_relay_session(
+        self,
+        session_id: bytes,
+        initiator_did: str,
+        target_did: str,
+        state: str,
+        cap_token_hash: bytes,
+        opened_at: int,
+        expires_at: int,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO relay_sessions "
+                "(session_id, initiator_did, target_did, state, cap_token_hash, "
+                " opened_at, expires_at, closed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                (session_id, initiator_did, target_did, state, cap_token_hash,
+                 opened_at, expires_at),
+            )
+            self._conn.commit()
+
+    def record_relay_receipt(
+        self,
+        session_id: bytes,
+        seq: int,
+        msg_hash: bytes,
+        timestamp: int,
+        direction: int,
+        cumulative_msgs: int,
+        cumulative_bytes: int,
+        prev_hash: bytes,
+        relay_sig: bytes,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO relay_receipts "
+                "(session_id, seq, msg_hash, timestamp, direction, "
+                " cumulative_msgs, cumulative_bytes, prev_hash, relay_sig) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, seq, msg_hash, timestamp, direction,
+                 cumulative_msgs, cumulative_bytes, prev_hash, relay_sig),
+            )
+            self._conn.commit()
+
 
 # ============================================================================
 # Pydantic request/response models
@@ -548,6 +620,18 @@ class AuthorityState:
         # WebSocket connection manager
         self.ws_manager = ConnectionManager()
 
+        # QASP-Relay (CapFlow) — per-message capability-gated forwarding
+        self._relay_receipt_key = os.urandom(32)
+        self.relay_manager = RelayManager(
+            relay_did=str(self.did),
+            relay_signing_key=self.secret_key,
+            receipt_key=self._relay_receipt_key,
+            ws_manager=self.ws_manager,
+            token_verifier=_AuthorityTokenVerifier(self),
+            agent_is_connected=self.ws_manager.is_connected,
+            on_receipt=self._persist_relay_receipt,
+        )
+
         # Admin API key
         self.admin_api_key = admin_api_key or uuid.uuid4().hex
 
@@ -695,6 +779,54 @@ class AuthorityState:
 
         return agent, api_key
 
+    async def _persist_relay_receipt(self, r: "RelayReceipt") -> None:
+        import asyncio
+        await asyncio.to_thread(
+            self.store.record_relay_receipt,
+            r.session_id, r.seq, r.msg_hash, r.timestamp, r.direction,
+            r.cumulative_msgs, r.cumulative_bytes, r.prev_hash, r.relay_sig,
+        )
+
+
+# ============================================================================
+# Relay capability verifier adapter
+# ============================================================================
+
+
+class _AuthorityTokenVerifier:
+    """Adapter from AuthorityState's DID registry to RelayManager's verifier protocol."""
+
+    def __init__(self, state: "AuthorityState") -> None:
+        self._state = state
+
+    def verify(self, cap_bytes: bytes, initiator_did: str):
+        import hashlib
+        token_hash = hashlib.sha384(cap_bytes).digest().hex()
+        for token in self._state.tokens.values():
+            if hashlib.sha384(token.to_cbor()).digest().hex() == token_hash:
+                # Found a matching registered token — verify owner matches initiator
+                if str(token.subject_did) != initiator_did:
+                    raise ValueError("initiator is not the token subject")
+                # Use the DID registry to fetch the issuer's public key
+                try:
+                    issuer_doc = self._state.did_registry.lookup(token.issuer_did)
+                    pk = issuer_doc.verification_methods[0].get_public_key()
+                except Exception as exc:
+                    raise ValueError(f"issuer resolution failed: {exc}") from exc
+                if not verify_token(token, pk):
+                    raise ValueError("invalid signature")
+                return token
+        raise ValueError("capability token not registered with this authority")
+
+    def attenuate(self, cap_token, relay_did: str, session_id: bytes) -> bytes:
+        att = attenuate_for_target(
+            source_token=cap_token,
+            relay_secret_key=self._state.secret_key,
+            target_did=self._state.did,  # for PoC; Task 11 will refine
+            session_id=session_id,
+        )
+        return att.to_cbor()
+
 
 # ============================================================================
 # WebSocket connection manager
@@ -733,6 +865,17 @@ class ConnectionManager:
             return False
         try:
             await ws.send_json(data)
+            return True
+        except Exception:
+            await self.disconnect(did_str)
+            return False
+
+    async def send_bytes(self, did_str: str, payload: bytes) -> bool:
+        ws = self._connections.get(did_str)
+        if ws is None:
+            return False
+        try:
+            await ws.send_bytes(payload)
             return True
         except Exception:
             await self.disconnect(did_str)
@@ -878,6 +1021,16 @@ def _api_key(x_api_key: str | None = Header(None)) -> str:
 
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
+
+
+@app.on_event("startup")
+async def _start_relay_epoch_loop() -> None:
+    from qasp.protocol.relay.scm import EPOCH_INTERVAL_SEC
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(EPOCH_INTERVAL_SEC)
+            await state.relay_manager.rotate_epoch()
+    asyncio.create_task(_loop())
 
 
 # -- Info -------------------------------------------------------------------
@@ -2110,32 +2263,44 @@ async def _ws_welcome_and_flush(websocket: WebSocket, agent: AgentRecord) -> Non
 async def _ws_listen_loop(websocket: WebSocket, agent: AgentRecord) -> None:
     """Shared WebSocket listen loop used by both /ws and /ws/register.
 
-    Blocks until the connection closes.  The finally block marks the agent
-    offline, removes the connection, and decrements the Prometheus gauge.
+    Handles JSON control frames (ping/ack/tool_result) and binary CBOR frames
+    (QASP-Relay 0x20-0x26 messages dispatched to state.relay_manager).
     """
     try:
         while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type", "")
+            raw = await websocket.receive()
+            if raw["type"] == "websocket.disconnect":
+                break
 
-            if msg_type == "ping":
-                await websocket.send_json({
-                    "type": "pong",
-                    "timestamp": datetime.now(UTC).isoformat(),
-                })
-            elif msg_type == "ack":
-                message_id = data.get("message_id")
-                if message_id:
-                    state.store.mark_message_delivered(message_id)
-            elif msg_type == "tool_result":
-                request_id = data.get("request_id")
-                if request_id:
-                    state.ws_manager.resolve_pending(request_id, data.get("result", {}))
-            else:
-                await websocket.send_json({
-                    "type": "error",
-                    "detail": f"Unknown message type: {msg_type}",
-                })
+            text = raw.get("text")
+            if text is not None:
+                import json as _json
+                data = _json.loads(text)
+                msg_type = data.get("type", "")
+                if msg_type == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    })
+                elif msg_type == "ack":
+                    message_id = data.get("message_id")
+                    if message_id:
+                        state.store.mark_message_delivered(message_id)
+                elif msg_type == "tool_result":
+                    request_id = data.get("request_id")
+                    if request_id:
+                        state.ws_manager.resolve_pending(request_id, data.get("result", {}))
+                else:
+                    await websocket.send_json({
+                        "type": "error",
+                        "detail": f"Unknown message type: {msg_type}",
+                    })
+                continue
+
+            payload = raw.get("bytes")
+            if payload is not None:
+                await state.relay_manager.handle_frame(agent.did_str, payload)
+                continue
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -2143,6 +2308,7 @@ async def _ws_listen_loop(websocket: WebSocket, agent: AgentRecord) -> None:
     finally:
         agent.status = "offline"
         await state.ws_manager.disconnect(agent.did_str)
+        await state.relay_manager.close_all_for_agent(agent.did_str)
         if PROMETHEUS_AVAILABLE:
             WEBSOCKET_CONNECTIONS.dec()
         logger.info("WebSocket DISCONNECTED: '%s' (%s) — status → offline", agent.name, agent.did_str)
