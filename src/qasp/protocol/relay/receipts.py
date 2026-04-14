@@ -223,7 +223,7 @@ def build_session_summary(
     draft = Receipt(
         records=records,
         total_units=total_units,
-        total_cost=0,
+        total_cost=total_bytes,
         issued_at=datetime.now(UTC),
         issuer=issuer,
         signature=b"",
@@ -235,7 +235,7 @@ def build_session_summary(
     return Receipt(
         records=draft.records,
         total_units=total_units,
-        total_cost=total_bytes,  # PoC: cost equals total bytes relayed
+        total_cost=total_bytes,
         issued_at=draft.issued_at,
         issuer=issuer,
         signature=sig,
