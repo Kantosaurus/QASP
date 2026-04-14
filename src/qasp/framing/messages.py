@@ -1,6 +1,6 @@
 """Protocol message definitions.
 
-This module defines the 22 QASP message types per Table IV of the
+This module defines the 29 QASP message types per Table IV of the
 QASP protocol specification (0x01-0x16).
 """
 
@@ -58,6 +58,7 @@ class MessageType(IntEnum):
     - 0x11-0x12: Channel management
     - 0x13-0x14: Pricing and alerts
     - 0x1B-0x1C: OCSP
+    - 0x20-0x26: Relay (CapFlow)
     """
 
     # Handshake messages
@@ -113,6 +114,15 @@ class MessageType(IntEnum):
     # Agent-to-agent messaging
     AGENT_MESSAGE = 0x1D
     AGENT_MESSAGE_ACK = 0x1E
+
+    # QASP-Relay (CapFlow) — PRD Table 2
+    RELAY_SESSION_REQUEST = 0x20
+    RELAY_SESSION_GRANT = 0x21
+    RELAY_SESSION_DENY = 0x22
+    RELAY_SESSION_NOTIFY = 0x23
+    RELAY_SESSION_ACCEPT = 0x24
+    RELAY_DATA = 0x25
+    RELAY_SESSION_CLOSE = 0x26
 
 
 @dataclass(frozen=True)
