@@ -100,7 +100,7 @@ class RelaySessionRequest:
             target_agent=str(d["target_agent"]),
             capability_token=bytes(d["capability_token"]),
             session_params=RelaySessionParams.from_dict(d["session_params"]),
-            ephemeral_pk=bytes(d["ephemeral_pk"]) if d.get("ephemeral_pk") else None,
+            ephemeral_pk=bytes(d["ephemeral_pk"]) if d.get("ephemeral_pk") is not None else None,
             nonce=bytes(d["nonce"]),
         )
 
@@ -238,7 +238,7 @@ class RelayData:
             scm=bytes(d["scm"]),
             seq=int(d["seq"]),
             payload=bytes(d["payload"]),
-            receipt_ack=bytes(d["receipt_ack"]) if d.get("receipt_ack") else None,
+            receipt_ack=bytes(d["receipt_ack"]) if d.get("receipt_ack") is not None else None,
         )
 
 
