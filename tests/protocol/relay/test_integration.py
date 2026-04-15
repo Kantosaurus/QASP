@@ -73,6 +73,16 @@ def _register(client, name: str):
     return ws_cm, ws, reg
 
 
+def _register_rest(client, name: str, tools: list[dict[str, str]] | None = None) -> dict:
+    resp = client.post("/register", json={
+        "name": name,
+        "tools": tools or [],
+        "callback_url": "",
+    })
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
 def _register_token_with_state(token):
     """Register the capability token with the authority so _AuthorityTokenVerifier can find it.
 
@@ -82,6 +92,61 @@ def _register_token_with_state(token):
     """
     token_id_hex = token.token_id.hex()
     srv.state.tokens[token_id_hex] = token
+
+
+def test_unregister_requires_self_auth_and_cannot_target_other_did(client):
+    """DELETE /unregister removes only the caller bound to X-API-Key."""
+    alice = _register_rest(client, "alice")
+    bob = _register_rest(client, "bob")
+
+    resp = client.request(
+        "DELETE",
+        f"/unregister?did={bob['did']}",  # ignored by server, included as adversarial input
+        headers={"X-API-Key": alice["api_key"]},
+    )
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["unregistered"] is True
+    assert payload["did"] == alice["did"]
+
+    # Alice key is now invalid (identity removed).
+    denied = client.get("/discover", headers={"X-API-Key": alice["api_key"]})
+    assert denied.status_code == 401
+
+    # Bob still exists and can authenticate/discover.
+    ok = client.get("/discover", headers={"X-API-Key": bob["api_key"]})
+    assert ok.status_code == 200
+    listed_dids = {agent["did"] for agent in ok.json()}
+    assert bob["did"] in listed_dids
+    assert alice["did"] not in listed_dids
+
+
+def test_unregister_revokes_tokens_for_unregistered_agent(client):
+    """Unregistering either token subject or audience must revoke affected tokens."""
+    alice = _register_rest(client, "alice")
+    bob = _register_rest(client, "bob", tools=[{"name": "echo", "description": "Echo input"}])
+
+    # Alice requests a token to call Bob's tool.
+    token_resp = client.post(
+        "/tokens/request",
+        json={"target_did": bob["did"], "tool_name": "echo"},
+        headers={"X-API-Key": alice["api_key"]},
+    )
+    assert token_resp.status_code == 200, token_resp.text
+    token_id = token_resp.json()["token_id"]
+
+    # Initially active.
+    status_before = client.get(f"/tokens/status/{token_id}")
+    assert status_before.status_code == 200
+    assert status_before.json()["status"] == "GOOD"
+
+    # Bob unregisters -> token audience disappears -> token is revoked.
+    unreg = client.request("DELETE", "/unregister", headers={"X-API-Key": bob["api_key"]})
+    assert unreg.status_code == 200, unreg.text
+
+    status_after = client.get(f"/tokens/status/{token_id}")
+    assert status_after.status_code == 200
+    assert status_after.json()["status"] == "REVOKED"
 
 
 def test_relay_session_end_to_end_happy_path(client):

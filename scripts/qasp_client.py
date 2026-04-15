@@ -260,6 +260,19 @@ class QASPClient:
         self._agent_name = name
         return result
 
+    def unregister(self) -> dict[str, Any]:
+        """Unregister this agent identity from the authority.
+
+        Returns:
+            Dict with unregistered status and DID details.
+        """
+        result = self._request("DELETE", "/unregister")
+        self._api_key = None
+        self._did = None
+        self._agent_name = ""
+        self._conversations.clear()
+        return result
+
     def discover(
         self,
         capability: str = "*",
