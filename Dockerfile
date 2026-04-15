@@ -24,10 +24,10 @@ RUN git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git && \
     mkdir build && \
     cd build && \
     cmake -GNinja \
-        -DCMAKE_INSTALL_PREFIX=/liboqs-install \
-        -DBUILD_SHARED_LIBS=ON \
-        -DOQS_BUILD_ONLY_LIB=ON \
-        .. && \
+    -DCMAKE_INSTALL_PREFIX=/liboqs-install \
+    -DBUILD_SHARED_LIBS=ON \
+    -DOQS_BUILD_ONLY_LIB=ON \
+    .. && \
     ninja && \
     ninja install
 
@@ -93,12 +93,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy project files
 COPY pyproject.toml .
 COPY README.md .
+COPY docs/ docs/
 COPY src/ src/
 COPY tests/ tests/
 COPY scripts/ scripts/
 
-# Install all dependencies including dev tools + server deps
-RUN pip install -e ".[dev]" && pip install fastapi uvicorn httpx
+# Install all dependencies including dev tools + server deps.
+# Use uvicorn[standard] so WebSocket upgrades work (/ws, /ws/register).
+RUN pip install -e ".[dev]" && pip install fastapi uvicorn "uvicorn[standard]" websockets wsproto httpx
 
 # Default to interactive bash shell
 ENTRYPOINT ["/bin/bash"]
@@ -112,6 +114,7 @@ FROM python-base AS test
 # Copy project files
 COPY pyproject.toml .
 COPY README.md .
+COPY docs/ docs/
 COPY src/ src/
 COPY tests/ tests/
 
@@ -131,6 +134,7 @@ FROM python-base AS lint
 # Copy project files
 COPY pyproject.toml .
 COPY README.md .
+COPY docs/ docs/
 COPY src/ src/
 COPY tests/ tests/
 

@@ -13,6 +13,7 @@ services:
     volumes:
       - ./src:/app/src:Z
       - ./tests:/app/tests:Z
+      - ./docs:/app/docs:Z
     working_dir: /app
 
   # Test runner with source mounts
@@ -24,6 +25,7 @@ services:
     volumes:
       - ./src:/app/src:Z
       - ./tests:/app/tests:Z
+      - ./docs:/app/docs:Z
     working_dir: /app
 
   # Full static analysis (ruff + mypy + bandit)
@@ -35,6 +37,7 @@ services:
     volumes:
       - ./src:/app/src:Z
       - ./tests:/app/tests:Z
+      - ./docs:/app/docs:Z
     working_dir: /app
 
   # Type checking only (mypy)
@@ -45,6 +48,7 @@ services:
     image: qasp:lint
     volumes:
       - ./src:/app/src:Z
+      - ./docs:/app/docs:Z
     working_dir: /app
     entrypoint: ["mypy"]
     command: ["src/"]
@@ -57,6 +61,7 @@ services:
     image: qasp:lint
     volumes:
       - ./src:/app/src:Z
+      - ./docs:/app/docs:Z
     working_dir: /app
     entrypoint: ["bandit"]
     command: ["-r", "src/"]
