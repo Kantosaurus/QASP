@@ -69,7 +69,7 @@ COPY scripts/ scripts/
 COPY docs/ docs/
 
 RUN pip install -e "." && \
-    pip install fastapi uvicorn httpx prometheus-client
+    pip install fastapi "uvicorn[standard]" websockets wsproto httpx prometheus-client
 
 EXPOSE 8080
 
