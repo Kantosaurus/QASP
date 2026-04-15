@@ -182,6 +182,35 @@ def qasp_register(
     }
 
 
+@mcp.tool()
+def qasp_unregister(agent_name: str) -> dict[str, Any]:
+    """Unregister an existing MCP session from the QASP authority.
+
+    Args:
+        agent_name: Name of your registered agent.
+
+    Returns:
+        Confirmation that the agent identity has been removed.
+    """
+    client = _get_session(agent_name)
+    result = client._request("DELETE", "/unregister")
+
+    did = client.did
+    _sessions.pop(agent_name, None)
+
+    if did:
+        keys_to_drop = [k for k in _token_cache if k.startswith(f"{did}:")]
+        for key in keys_to_drop:
+            _token_cache.pop(key, None)
+
+    return {
+        "agent_name": agent_name,
+        "did": result.get("did", did),
+        "unregistered": bool(result.get("unregistered", False)),
+        "message": f"Agent '{agent_name}' unregistered successfully.",
+    }
+
+
 # -- Discovery ---------------------------------------------------------------
 
 @mcp.tool()

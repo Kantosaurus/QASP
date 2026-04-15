@@ -779,6 +779,26 @@ class AuthorityState:
 
         return agent, api_key
 
+    def unregister_agent(self, agent: AgentRecord) -> None:
+        """Remove an agent from all in-memory registries."""
+        self.agents_by_api_key.pop(agent.api_key, None)
+        self.agents_by_did.pop(agent.did_str, None)
+        self.did_registry.remove(agent.did_str)
+        self.trust_registry.remove(agent.did_str)
+
+        if PROMETHEUS_AVAILABLE:
+            AGENTS_REGISTERED.set(len(self.agents_by_did))
+
+    def tokens_for_agent(self, did_str: str) -> list[tuple[str, CapabilityToken]]:
+        """Return all tokens whose subject or audience is the given DID."""
+        matched: list[tuple[str, CapabilityToken]] = []
+        for tid_hex, token in self.tokens.items():
+            subject_did = str(token.subject_did)
+            audience_did = str(token.audience_did) if token.audience_did else None
+            if subject_did == did_str or audience_did == did_str:
+                matched.append((tid_hex, token))
+        return matched
+
     async def _persist_relay_receipt(self, r: "RelayReceipt") -> None:
         import asyncio
         await asyncio.to_thread(
@@ -855,6 +875,24 @@ class ConnectionManager:
     async def disconnect(self, did_str: str) -> None:
         async with self._lock:
             self._connections.pop(did_str, None)
+
+    async def close_connection(
+        self,
+        did_str: str,
+        *,
+        code: int = 1000,
+        reason: str = "Connection closed",
+    ) -> bool:
+        """Close and remove an active connection if present."""
+        async with self._lock:
+            ws = self._connections.pop(did_str, None)
+        if ws is None:
+            return False
+        try:
+            await ws.close(code=code, reason=reason)
+        except Exception:
+            pass
+        return True
 
     def is_connected(self, did_str: str) -> bool:
         return did_str in self._connections
@@ -1122,6 +1160,63 @@ def register(body: RegisterRequest, request: Request):
         "ws_url": f"/ws?api_key={api_key}",
         "notice": "WebSocket connection required. Connect to /ws?api_key=<your_api_key> to go online.",
         "skill_document": state.skill_document,
+    }
+
+
+@app.delete("/unregister")
+async def unregister(x_api_key: str | None = Header(None)):
+    caller = state.resolve_agent(_api_key(x_api_key))
+
+    logger.info("--- DELETE /unregister ---")
+    logger.info("  Agent: '%s' (%s)", caller.name, caller.did_str)
+
+    # Force-close active WebSocket, then teardown relay sessions.
+    await state.ws_manager.close_connection(
+        caller.did_str,
+        code=4000,
+        reason="Agent unregistered",
+    )
+    await state.relay_manager.close_all_for_agent(caller.did_str)
+
+    # Revoke all active tokens tied to this agent identity.
+    revoked_count = 0
+    for tid_hex, _ in state.tokens_for_agent(caller.did_str):
+        token_id_bytes = bytes.fromhex(tid_hex)
+        if state.crl.is_revoked(token_id_bytes):
+            continue
+        try:
+            entries = state.crl.revoke(
+                token_id=token_id_bytes,
+                reason=RevocationReason.OWNER_REQUEST,
+                urgency=RevocationUrgency.CRITICAL,
+                revoker_did=str(caller.did),
+                revoker_secret_key=state.secret_key,
+            )
+        except Exception as exc:
+            logger.warning("  Failed to revoke token %s... during unregister: %s", tid_hex[:16], exc)
+            continue
+
+        state.ocsp.invalidate(token_id_bytes)
+        state.store.insert_token_event(tid_hex, "revoked", "agent_unregistered")
+        revoked_count += len(entries)
+        await _notify_revocation(tid_hex, caller.did_str, "OWNER_REQUEST")
+
+    # Remove this exact caller identity from registry maps.
+    caller.status = "offline"
+    state.unregister_agent(caller)
+
+    if PROMETHEUS_AVAILABLE and revoked_count > 0:
+        TOKENS_REVOKED.inc(revoked_count)
+
+    logger.info(
+        "  Agent unregistered: '%s' (%s), revoked token entries=%d",
+        caller.name, caller.did_str, revoked_count,
+    )
+    return {
+        "unregistered": True,
+        "did": caller.did_str,
+        "name": caller.name,
+        "revoked_entries": revoked_count,
     }
 
 
