@@ -26,6 +26,50 @@ services:
       - qasp-node-a
       - qasp-node-b
 
+  qasp-authority:
+    build:
+      context: .
+      target: authority
+    image: qasp:authority
+    container_name: qasp-authority
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - qasp-data:/data
+    networks:
+      - qasp-net
+    environment:
+      - QASP_SERVER_URL=http://qasp-authority:8080
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  qasp-mcp-bridge:
+    build:
+      context: .
+      target: authority
+    image: qasp:authority
+    container_name: qasp-mcp-bridge
+    restart: unless-stopped
+    depends_on:
+      qasp-authority:
+        condition: service_healthy
+    ports:
+      - "8888:8888"
+    networks:
+      - qasp-net
+    environment:
+      - QASP_SERVER_URL=http://qasp-authority:8080
+    entrypoint: ["python", "scripts/qasp_mcp_server.py"]
+    command: ["--transport", "sse", "--port", "8888", "--server", "http://qasp-authority:8080"]
+
 networks:
   qasp-net:
     driver: bridge
+
+volumes:
+  qasp-data:

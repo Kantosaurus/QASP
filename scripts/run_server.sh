@@ -1,34 +1,51 @@
 #!/bin/bash
-# Quick setup for running QASP Authority Server on a VPS with Docker.
+# Bring up the QASP Authority Server (plus optional MCP bridge sidecar) via docker compose -f docker-compose.yml.
 #
 # Usage:
-#   chmod +x scripts/run_server.sh
-#   ./scripts/run_server.sh
+#   ./scripts/run_server.sh            # authority only
+#   ./scripts/run_server.sh --with-mcp # authority + MCP bridge sidecar
+#   ./scripts/run_server.sh --down     # stop everything
 #
 # Prerequisites:
-#   - Docker (or Podman with docker alias)
-#   - Port 8080 available
+#   - Docker (with compose v2) or Podman with docker alias
+#   - Port 8080 available (and 8888 if --with-mcp)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 cd "$PROJECT_DIR"
 
-echo "=== Building QASP dev image ==="
-docker build --target dev -t qasp:dev .
+SERVICES=(qasp-authority)
+ACTION="up"
 
-echo "=== Starting QASP Authority Server on port 8080 ==="
-docker run -d --name qasp-server \
-  --restart unless-stopped \
-  -p 8080:8080 \
-  -v "$PROJECT_DIR/scripts:/app/scripts" \
-  qasp:dev -c "pip install fastapi uvicorn httpx && python scripts/qasp_server.py --host 0.0.0.0 --port 8080"
+for arg in "$@"; do
+  case "$arg" in
+    --with-mcp) SERVICES+=(qasp-mcp-bridge) ;;
+    --down)     ACTION="down" ;;
+    -h|--help)
+      sed -n '2,12p' "$0"
+      exit 0
+      ;;
+    *) echo "Unknown arg: $arg" >&2; exit 1 ;;
+  esac
+done
+
+if [[ "$ACTION" == "down" ]]; then
+  echo "=== Stopping QASP stack ==="
+  docker compose -f docker-compose.yml down
+  exit 0
+fi
+
+echo "=== Building & starting: ${SERVICES[*]} ==="
+docker compose -f docker-compose.yml up -d --build "${SERVICES[@]}"
 
 echo ""
-echo "Server running! Test with:"
-echo "  curl http://localhost:8080/"
+echo "Authority:        http://localhost:8080/"
+echo "Metrics:          http://localhost:8080/metrics"
+if printf '%s\n' "${SERVICES[@]}" | grep -q qasp-mcp-bridge; then
+  echo "MCP bridge (SSE): http://localhost:8888/sse"
+fi
 echo ""
-echo "Stop with:"
-echo "  docker stop qasp-server && docker rm qasp-server"
+echo "Logs:  docker compose -f docker-compose.yml logs -f ${SERVICES[*]}"
+echo "Stop:  ./scripts/run_server.sh --down"

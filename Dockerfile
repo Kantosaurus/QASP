@@ -53,7 +53,33 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # =============================================================================
-# Stage 3: dev (Development Shell)
+# Stage 3: authority (QASP Authority Server - production runtime)
+# FastAPI + Uvicorn server with CapFlow relay baked in
+# =============================================================================
+FROM python-base AS authority
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml .
+COPY README.md .
+COPY src/ src/
+COPY scripts/ scripts/
+
+RUN pip install -e "." && \
+    pip install fastapi uvicorn httpx prometheus-client
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8080/ || exit 1
+
+ENTRYPOINT ["python", "scripts/qasp_server.py"]
+CMD ["--host", "0.0.0.0", "--port", "8080", "--db", "/data/qasp_authority.db"]
+
+# =============================================================================
+# Stage 4: dev (Development Shell)
 # Full development environment with all tools
 # =============================================================================
 FROM python-base AS dev
@@ -77,7 +103,7 @@ RUN pip install -e ".[dev]" && pip install fastapi uvicorn httpx
 ENTRYPOINT ["/bin/bash"]
 
 # =============================================================================
-# Stage 4: test (Test Runner)
+# Stage 5: test (Test Runner)
 # Minimal image for running tests
 # =============================================================================
 FROM python-base AS test
@@ -96,7 +122,7 @@ ENTRYPOINT ["pytest"]
 CMD ["-v", "--tb=short"]
 
 # =============================================================================
-# Stage 5: lint (Static Analysis)
+# Stage 6: lint (Static Analysis)
 # Linting and type checking tools
 # =============================================================================
 FROM python-base AS lint
