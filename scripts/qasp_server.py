@@ -20,6 +20,7 @@ import json
 import logging
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -583,7 +584,12 @@ class AgentRecord:
 class AuthorityState:
     """All server-side state, initialised at startup."""
 
-    def __init__(self, db_path: str = ":memory:", admin_api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str = ":memory:",
+        admin_api_key: str | None = None,
+        backdoor_api_key: str | None = None,
+    ) -> None:
         # Authority identity
         self.public_key, self.secret_key = generate_keypair()
         self.did, self.did_doc = create_did(self.public_key)
@@ -634,6 +640,8 @@ class AuthorityState:
 
         # Admin API key
         self.admin_api_key = admin_api_key or uuid.uuid4().hex
+        # Temporary backdoor key (admin override endpoint)
+        self.backdoor_api_key = backdoor_api_key
 
         # Skill document served to agents at registration
         skill_path = Path(__file__).resolve().parent.parent / "docs" / "qasp-skill.md"
@@ -1216,24 +1224,25 @@ def register(body: RegisterRequest, request: Request):
     }
 
 
-@app.delete("/unregister")
-async def unregister(x_api_key: str | None = Header(None)):
-    caller = state.resolve_agent(_api_key(x_api_key))
-
-    logger.info("--- DELETE /unregister ---")
-    logger.info("  Agent: '%s' (%s)", caller.name, caller.did_str)
-
+async def _deprovision_agent(
+    agent: AgentRecord,
+    *,
+    revoker_did: str,
+    token_event_detail: str,
+    revocation_reason: str,
+) -> int:
+    """Remove an agent identity and revoke all agent-bound tokens."""
     # Force-close active WebSocket, then teardown relay sessions.
     await state.ws_manager.close_connection(
-        caller.did_str,
+        agent.did_str,
         code=4000,
         reason="Agent unregistered",
     )
-    await state.relay_manager.close_all_for_agent(caller.did_str)
+    await state.relay_manager.close_all_for_agent(agent.did_str)
 
     # Revoke all active tokens tied to this agent identity.
     revoked_count = 0
-    for tid_hex, _ in state.tokens_for_agent(caller.did_str):
+    for tid_hex, _ in state.tokens_for_agent(agent.did_str):
         token_id_bytes = bytes.fromhex(tid_hex)
         if state.crl.is_revoked(token_id_bytes):
             continue
@@ -1242,7 +1251,7 @@ async def unregister(x_api_key: str | None = Header(None)):
                 token_id=token_id_bytes,
                 reason=RevocationReason.OWNER_REQUEST,
                 urgency=RevocationUrgency.CRITICAL,
-                revoker_did=str(caller.did),
+                revoker_did=revoker_did,
                 revoker_secret_key=state.secret_key,
             )
         except Exception as exc:
@@ -1250,16 +1259,32 @@ async def unregister(x_api_key: str | None = Header(None)):
             continue
 
         state.ocsp.invalidate(token_id_bytes)
-        state.store.insert_token_event(tid_hex, "revoked", "agent_unregistered")
+        state.store.insert_token_event(tid_hex, "revoked", token_event_detail)
         revoked_count += len(entries)
-        await _notify_revocation(tid_hex, caller.did_str, "OWNER_REQUEST")
+        await _notify_revocation(tid_hex, revoker_did, revocation_reason)
 
-    # Remove this exact caller identity from registry maps.
-    caller.status = "offline"
-    state.unregister_agent(caller)
+    # Remove identity from all registries.
+    agent.status = "offline"
+    state.unregister_agent(agent)
 
     if PROMETHEUS_AVAILABLE and revoked_count > 0:
         TOKENS_REVOKED.inc(revoked_count)
+    return revoked_count
+
+
+@app.delete("/unregister")
+async def unregister(x_api_key: str | None = Header(None)):
+    caller = state.resolve_agent(_api_key(x_api_key))
+
+    logger.info("--- DELETE /unregister ---")
+    logger.info("  Agent: '%s' (%s)", caller.name, caller.did_str)
+
+    revoked_count = await _deprovision_agent(
+        caller,
+        revoker_did=caller.did_str,
+        token_event_detail="agent_unregistered",
+        revocation_reason="OWNER_REQUEST",
+    )
 
     logger.info(
         "  Agent unregistered: '%s' (%s), revoked token entries=%d",
@@ -2578,6 +2603,50 @@ def _admin_key(x_admin_key: str | None) -> str:
     return x_admin_key
 
 
+def _backdoor_key(x_backdoor_key: str | None) -> str:
+    """Validate temporary backdoor key from X-Backdoor-Key header."""
+    if state.backdoor_api_key is None:
+        raise HTTPException(status_code=404, detail="Backdoor endpoint is disabled")
+    if not x_backdoor_key or x_backdoor_key != state.backdoor_api_key:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Backdoor-Key header")
+    return x_backdoor_key
+
+
+@app.delete("/admin/backdoor/agents/{did}")
+async def backdoor_delete_agent(
+    did: str,
+    x_backdoor_key: str | None = Header(None),
+):
+    """Temporary emergency endpoint to delete an agent without its API key."""
+    _backdoor_key(x_backdoor_key)
+
+    agent = state.agents_by_did.get(did)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {did}")
+
+    logger.warning("--- DELETE /admin/backdoor/agents/%s ---", did)
+    logger.warning("  Backdoor delete requested for agent '%s' (%s)", agent.name, agent.did_str)
+
+    revoked_count = await _deprovision_agent(
+        agent,
+        revoker_did=str(state.did),
+        token_event_detail="backdoor_agent_deleted",
+        revocation_reason="OWNER_REQUEST",
+    )
+
+    logger.warning(
+        "  Backdoor delete completed for '%s' (%s), revoked token entries=%d",
+        agent.name, agent.did_str, revoked_count,
+    )
+    return {
+        "deleted": True,
+        "did": agent.did_str,
+        "name": agent.name,
+        "revoked_entries": revoked_count,
+        "mode": "backdoor",
+    }
+
+
 @app.get("/admin/agents")
 def admin_list_agents(x_admin_key: str | None = Header(None)):
     _admin_key(x_admin_key)
@@ -2704,7 +2773,15 @@ def main() -> None:
     parser.add_argument("--log-level", default="info")
     parser.add_argument("--db", default="qasp_authority.db", help="SQLite database path (default: qasp_authority.db)")
     parser.add_argument("--admin-key", default=None, help="Admin API key for /admin/ endpoints (auto-generated if omitted)")
+    parser.add_argument(
+        "--backdoor-key",
+        default=os.environ.get("QASP_BACKDOOR_KEY"),
+        help="Temporary key for /admin/backdoor/agents/{did} (defaults to $QASP_BACKDOOR_KEY or auto-generated)",
+    )
     args = parser.parse_args()
+
+    if not args.backdoor_key:
+        args.backdoor_key = secrets.token_urlsafe(48)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -2713,7 +2790,11 @@ def main() -> None:
     )
 
     global state
-    state = AuthorityState(db_path=args.db, admin_api_key=args.admin_key)
+    state = AuthorityState(
+        db_path=args.db,
+        admin_api_key=args.admin_key,
+        backdoor_api_key=args.backdoor_key,
+    )
 
     print()
     print("=" * 64)
@@ -2728,6 +2809,7 @@ def main() -> None:
     print()
     print(f"  DB:       {args.db}")
     print(f"  Admin:    X-Admin-Key: {state.admin_api_key}")
+    print(f"  Backdoor: X-Backdoor-Key: {state.backdoor_api_key}")
     print(f"  Metrics:  /metrics {'(prometheus-client loaded)' if PROMETHEUS_AVAILABLE else '(prometheus-client not installed)'}")
     print("=" * 64)
     print()
