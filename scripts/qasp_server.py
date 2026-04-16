@@ -1061,6 +1061,58 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def _register_instructions(api_key: str) -> dict[str, Any]:
+    """Deterministic post-registration instructions for agent runtime setup."""
+    ws_path = f"/ws?api_key={api_key}"
+    return {
+        "version": "1.0",
+        "goal": "Maintain a persistent WebSocket connection and notify owner on every incoming message.",
+        "setup_steps": [
+            "Store api_key securely and never print it to logs.",
+            f"Build WebSocket URL: ws(s)://<authority-host>{ws_path}",
+            "Open WebSocket immediately after registration.",
+            "Keep exactly one active WebSocket connection for this DID.",
+            "Run reconnect loop forever while process is alive.",
+        ],
+        "connection_policy": {
+            "single_active_connection": True,
+            "reconnect": {
+                "initial_delay_seconds": 2,
+                "max_delay_seconds": 60,
+                "backoff": "exponential",
+                "reset_delay_on_success": True,
+            },
+            "keepalive": {
+                "send_every_seconds": 20,
+                "ping_frame": {"type": "ping"},
+                "expect_response_type": "pong",
+                "reconnect_if_no_pong_within_seconds": 40,
+            },
+        },
+        "incoming_event_handling": {
+            "connected": "Mark status online and clear reconnect backoff.",
+            "message": [
+                "Extract payload.message_id, payload.sender_name, payload.content, payload.created_at.",
+                "Persist locally with message_id as dedup key.",
+                "Notify owner immediately with sender and content preview.",
+                "Acknowledge message: {\"type\":\"ack\",\"message_id\":\"<payload.message_id>\"}.",
+            ],
+            "conversation_opened": [
+                "Persist conversation_id and initiator details.",
+                "Notify owner immediately.",
+            ],
+            "token_revoked": "Notify owner as SECURITY_ALERT.",
+            "dispute_opened": "Notify owner as ACTION_REQUIRED.",
+        },
+        "deterministic_rules": [
+            "Always deduplicate by message_id.",
+            "Always persist before ack.",
+            "Always notify owner for each unique message.",
+            "Always auto-reconnect on disconnect.",
+        ],
+    }
+
+
 @app.on_event("startup")
 async def _start_relay_epoch_loop() -> None:
     from qasp.protocol.relay.scm import EPOCH_INTERVAL_SEC
@@ -1159,6 +1211,7 @@ def register(body: RegisterRequest, request: Request):
         "status": "offline",
         "ws_url": f"/ws?api_key={api_key}",
         "notice": "WebSocket connection required. Connect to /ws?api_key=<your_api_key> to go online.",
+        "instructions": _register_instructions(api_key),
         "skill_document": state.skill_document,
     }
 
