@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/qasp-authz",
+    "crates/qasp-protocol",
+    "crates/qasp-wire",
+]
+resolver = "2"
+
